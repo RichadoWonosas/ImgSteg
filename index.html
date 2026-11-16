@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light">
+  <title>ImgSteg（图隐）· 可还原的图片隐写</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="codec.js" defer></script><script src="steg.js" defer></script><script src="png.js" defer></script><script src="editor.js" defer></script><script src="app.js" defer></script>
+</head>
+<body>
+  <header class="topbar"><a class="brand" href="./index.html"><span class="brand-icon">▧</span> 图隐 <span class="brand-en">IMGSTEG</span></a><span class="local-badge"><i></i> 本地处理 · 无需上传服务器</span></header>
+  <main>
+    <div class="intro"><div class="eyebrow">REVERSIBLE IMAGE STEGANOGRAPHY</div><h1>把画面藏起来，<span>也能找回来。</span></h1><p>框选、遮盖，把原始像素和附加文字存入图片的低 3 位。只需一张 PNG，即可还原原图与底图。</p></div>
+    <div class="mode-tabs" role="tablist" aria-label="操作模式"><button id="tab-encode" role="tab" aria-selected="true" aria-controls="encode-controls">制作隐写图片</button><button id="tab-decode" role="tab" aria-selected="false" aria-controls="decode-controls">识别与还原</button></div>
+    <div class="workspace">
+      <section class="panel source-panel" aria-labelledby="source-title">
+        <div class="panel-heading"><h2 id="source-title"><span class="step">01</span> 图片与选区</h2><span id="dimensions" class="muted">等待选择</span></div>
+        <input id="file" class="file-input" type="file" accept="image/*" aria-label="选择本地图片">
+        <label class="dropzone" id="dropzone" for="file"><span class="upload-icon">↥</span><strong>选择图片，或拖放到这里</strong><span>制作时选择原图，还原时选择隐写 PNG</span><span class="choose-button">选择本地图片 <span>↗</span></span></label>
+        <div id="preview-box" class="preview-box" hidden><div class="editor-stage"><img id="preview" alt="图片编辑预览" draggable="false"><svg id="selection-overlay" xmlns="http://www.w3.org/2000/svg" aria-label="图片选区编辑器" aria-describedby="selection-help" tabindex="0" preserveAspectRatio="none"></svg></div><div class="image-caption"><span id="filename"></span><label for="file" class="change-image">更换图片 ↗</label></div></div>
+        <div class="editor-options"><label id="show-fill-label"><input id="show-fill" type="checkbox" checked> 预览填充后的 i2</label><span id="source-info">RGB 每通道低 3 位作为载体</span></div>
+        <p id="detection" class="detection" role="status">上传后自动识别本项目的隐写标记。</p><div class="demo-action"><button id="demo" class="text-button">使用合成示例图片 ↗</button></div>
+        <div id="encode-controls" role="tabpanel" aria-labelledby="tab-encode">
+          <div class="selection-tools"><label>新选区填充 <select id="new-fill"><option value="mosaic">马赛克</option><option value="white">纯白</option><option value="black">纯黑</option></select></label><label>马赛克块 <input id="block-size" type="number" min="2" max="128" value="12"> px</label></div>
+          <div class="region-heading"><strong id="region-count">0 个选区</strong><div><button id="add-region" class="text-button">添加选区</button><button id="clear-regions" class="text-button">清空</button></div></div>
+          <p id="no-regions" class="hint">在图上拖出矩形，或点击“添加选区”后填写坐标。可重叠，按列表顺序填充。</p><p id="selection-help" class="hint" aria-live="polite">双击选框以选中；拖动内部移动，拖动边或角缩放。方向键每次微调 1 像素；Esc 取消选中后可继续画框。</p><ol id="region-list" class="region-list"></ol>
+          <section class="attachment-entry" aria-labelledby="attachment-title"><div class="attachment-heading"><h3 id="attachment-title">附加图片 <span id="attachment-count">0 张</span></h3><button id="add-attachments" class="text-button" disabled>上传附加图片 ＋</button></div><input id="attachment-files" class="file-input" type="file" accept="image/*" multiple aria-label="选择多张附加图片" disabled><p class="hint">按列表顺序写在原图恢复数据之后、文字之前。可拖动排序或用上移/下移按钮调整；保存完整原文件。最多 32 张，总大小 32 MiB，能否放入以最终容量检查为准。</p><ol id="attachment-list" class="attachment-list"></ol></section>
+          <div class="text-entry"><label for="extra-text">附加文字 <span id="text-length">0 UTF-8 byte</span></label><textarea id="extra-text" rows="4" maxlength="1000000" placeholder="可选。文字将存放在所有图片恢复数据之后。"></textarea><p class="hint">原始区域可被任何持有图片的人恢复；这是可逆隐写，不是加密。</p></div>
+          <div class="actions"><button id="generate">计算并生成隐写 PNG ↗</button><button id="analyze" class="cancel">仅分析 i2 低位</button></div>
+        </div>
+        <div id="decode-controls" role="tabpanel" aria-labelledby="tab-decode" hidden><p class="hint">选择本项目导出的 PNG 后会自动识别并提取原图、i2、附加图片和文字。兼容 ImgSteg v1/v2，不是通用隐写检测。</p><div class="actions"><button id="restore" disabled>提取并还原 ↗</button></div></div>
+      </section>
+      <section class="panel results-panel" aria-labelledby="results-title">
+        <div class="panel-heading"><h2 id="results-title"><span class="step">02</span> 容量与结果</h2><span class="status-pill" id="state">尚未开始</span></div>
+        <div class="primary-result"><div class="metric-label">剩余的比特数 <code>r = 9wh − n</code></div><div class="big-number" id="remaining">— <small>bit</small></div><p id="result-note">选择图片后可编辑选区、计算并生成隐写图片。</p></div>
+        <div class="secondary-results"><div><div class="metric-label">剩余的最大字节数</div><strong id="bytes">—</strong><span class="unit">byte</span><code>b = r &gt;&gt; 3</code></div><div><div class="metric-label">剩余的等效像素数</div><strong id="pixels">—</strong><span class="unit">px</span><code>floor(b / 3)</code></div></div>
+        <section class="raw-capacity" aria-labelledby="raw-title"><h3 id="raw-title">剩余容量可容纳的 RAW 尺寸 <span>宽 × 高</span></h3><div class="raw-sizes"><div><span class="ratio-label">1:1</span><strong id="raw-square-size">— × —</strong><span id="raw-square-pixels">— 像素</span></div><div><span class="ratio-label">4:3</span><strong id="raw-standard-size">— × —</strong><span id="raw-standard-pixels">— 像素</span></div><div><span class="ratio-label">16:9</span><strong id="raw-wide-size">— × —</strong><span id="raw-wide-pixels">— 像素</span></div></div><p>RGB 每像素 3 字节，严格符合宽高比；容量不足时显示 0 × 0。</p></section>
+        <div class="breakdown"><div><span>总载体容量 <code>9wh</code></span><strong id="original">— bit</strong></div><div><span>完整内容长度 <code>n</code></span><strong id="compressed">— bit</strong></div><div><span>压缩方案</span><strong id="method">—</strong></div></div>
+        <ul id="compression-details" class="compression-details"></ul>
+        <div class="progress-track" role="progressbar" aria-label="处理进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progress"></div></div><p id="status" role="status" aria-live="polite">所有计算都在你的设备上完成。</p>
+        <div class="actions"><button id="download" disabled>下载低位压缩内容 ↓</button><button id="cancel" class="cancel" hidden>取消处理</button></div>
+        <section id="generated" class="output-section" hidden><h3>生成结果</h3><div id="steg-result"><img id="steg-preview" alt="生成的隐写图片"><a id="download-steg" class="download-link">下载隐写 PNG ↓</a><button id="restore-generated" class="text-button">在本页识别并还原这张图片 ↗</button><p class="hint">保留原始 PNG；转成 JPEG、缩放、截图或改色可能破坏隐写内容。</p></div><p id="overflow-result" class="error" hidden>恢复数据超出低位容量，未生成隐写图片。</p><a id="download-base" class="secondary-link">下载填充后的底图 i2 ↓</a></section>
+        <section id="restored" class="output-section" hidden><h3>已还原的图片</h3><div class="restored-images"><div><img id="original-output" alt="还原的原图"><a id="download-original" class="download-link">下载原图 ↓</a></div><div><img id="base-output" alt="还原的底图 i2"><a id="download-restored-base" class="download-link">下载 i2 ↓</a></div></div></section>
+        <section id="decoded-attachments-box" class="output-section" hidden><h3>提取的附加图片 <span id="decoded-attachment-count"></span></h3><ol id="decoded-attachments" class="decoded-attachments"></ol></section>
+        <section id="decode-text-box" class="output-section" hidden><h3>附加文字 <span id="text-summary"></span></h3><textarea id="decoded-text" readonly rows="5" aria-label="提取的附加文字"></textarea><a id="download-text" class="secondary-link">下载文字 TXT ↓</a></section>
+      </section>
+    </div>
+    <section class="explanation"><div><span class="eyebrow">HOW IMGSTEG WORKS</span><h2>一张图片，两种还原结果。</h2></div><div><p>保存原图各选区的完整 RGBA 数据，按选区顺序生成填充底图 i2。载荷依次存放原图恢复数据、按列表顺序排列的附加图片、附加文字；每个分块独立压缩，全部文件头与记录均计入 n。只有 n ≤ 9wh 才写入 RGB 的低 3 位，并输出不透明的无损 PNG。</p><p>恢复时先还原 i2 的低位与 Alpha，再将选区的原始像素贴回得到原图。附加图片保留完整原文件字节，按存放顺序提取。生成时会从导出的 PNG 再次提取，逐字节核对原图、i2、附图和文字。每块取浏览器支持的原生压缩与可逆排列候选中的最小值，不承诺理论最优压缩。</p><p class="fine-print">载体的 8 位、非交错 RGB/RGBA PNG 直接读取像素；其他载体格式以浏览器解码后的 8 位 sRGB 为准，动图仅处理一帧，不保存载体原文件元数据或编码。附加图片保留原格式与元数据。最多 4000 万像素、64 个选区，选区累计面积最多 4000 万像素；附图最多 32 张，总大小 32 MiB。低位隐写不提供保密性或抗篡改认证。</p></div></section>
+    <footer>图隐 / IMGSTEG <span>纯前端 · Web Worker · 无第三方依赖</span></footer>
+  </main>
+</body>
+</html>

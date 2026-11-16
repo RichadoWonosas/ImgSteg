@@ -1,0 +1,6 @@
+# Local test suites, generated fixtures, screenshots, and test tools.
+test/
+tests/
+
+# Ignore directories whose names begin with a dot, at any depth.
+.*/
