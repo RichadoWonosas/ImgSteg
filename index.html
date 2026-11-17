@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark">
   <title>ImgSteg（图隐）· 可还原的图片与差分图隐写</title>
-  <link rel="stylesheet" href="style.css?v=3">
-  <script src="codec.js?v=3" defer></script><script src="diff.js?v=3" defer></script><script src="steg.js?v=3" defer></script><script src="png.js?v=3" defer></script><script src="editor.js?v=3" defer></script><script src="app.js?v=3.1" defer></script>
+  <link rel="stylesheet" href="style.css?v=3.2">
+  <script src="codec.js?v=3" defer></script><script src="diff.js?v=3" defer></script><script src="steg.js?v=3" defer></script><script src="png.js?v=3" defer></script><script src="editor.js?v=3" defer></script><script src="app.js?v=3.2" defer></script>
 </head>
 <body>
   <header class="topbar"><a class="brand" href="./index.html"><span class="brand-icon">▧</span> 图隐 <span class="brand-en">IMGSTEG</span></a><span class="local-badge"><i></i> 本地处理 · 无需上传服务器</span></header>
@@ -12,7 +12,7 @@
     <div class="intro"><div class="eyebrow">REVERSIBLE IMAGE STEGANOGRAPHY</div><h1>一张图片，<span>不止一种画面。</span></h1><p>遮盖、派生差分图、附加图片与文字。把可恢复的内容，留在一张 PNG 里。</p></div>
     <nav class="mode-tabs" aria-label="工作模式"><div role="tablist" aria-label="操作模式"><button id="tab-encode" role="tab" aria-selected="true" aria-controls="encode-controls">制作隐写图片</button><button id="tab-decode" role="tab" aria-selected="false" aria-controls="decode-controls">识别与还原</button></div><details class="settings"><summary>主题设置 ⚙</summary><div class="settings-popover"><label>显示模式 <select id="theme-mode" aria-label="显示模式"><option value="system">跟随系统</option><option value="light">亮色</option><option value="dark">暗色</option></select></label><label for="theme-hue">主题色色相 <output id="hue-value">270°</output></label><input id="theme-hue" aria-label="主题色色相" type="range" min="0" max="360" step="1" value="270"><p>设置仅保存在本机，不影响图片数据。</p></div></details></nav>
     <div class="workspace">
-      <section class="panel source-panel" aria-labelledby="source-title">
+      <section id="image-preview-panel" class="panel source-panel" aria-labelledby="source-title">
         <div class="panel-heading"><h2 id="source-title"><span class="step">01</span> 图片预览</h2><span id="dimensions" class="muted">等待选择</span></div>
         <input id="file" class="file-input" type="file" accept="image/*" aria-label="选择本地图片">
         <label class="dropzone" id="dropzone" for="file"><span class="upload-icon">↥</span><strong>选择基底图，或拖放到这里</strong><span>制作时选择原图，还原时选择隐写 PNG</span><span class="choose-button">选择本地图片 ↗</span></label>

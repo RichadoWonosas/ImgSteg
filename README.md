@@ -10,6 +10,7 @@ The resulting PNG can restore the original image, the base image **i2**, a whole
 
 - Multiple rectangular regions with individual mosaic, white, or black fills and editable pixel coordinates.
 - Double-click selection; drag the interior to move, or any of eight edges/corners to resize.
+- Click a difference-image row's thumbnail, title, or blank area to preview it; click a non-control area of an editable region row to select it. Inputs, labels, dropdowns, and action buttons keep their own behavior.
 - One-pixel arrow-key adjustments. A selected edge responds only to its relevant axis; a corner responds to both. Press `Esc` to deselect and draw another rectangle.
 - Multiple attached images, preserving their original file bytes, names, formats, metadata, and animations. Reorder them by dragging or using the move buttons.
 - UTF-8 messages, including newlines, Chinese, emoji, a leading BOM, and NUL characters.
@@ -24,6 +25,8 @@ The resulting PNG can restore the original image, the base image **i2**, a whole
 ## Try it
 
 Open the [live demo](https://richadowonosas.github.io/ImgSteg/), or download this repository and open `index.html` in a modern browser. A basic static HTTP server also works; there is no application server to configure.
+
+Carrier-image file drops are accepted only inside the left **图片预览** (image preview) panel, including when replacing an existing image. Dropping files elsewhere does not upload or replace the carrier; the page prevents the browser from navigating to the dropped file. Attachment-list reordering remains independent.
 
 1. Choose **制作隐写图片** (create a steganographic image) and select a carrier image. The built-in synthetic example is available for experimentation.
 2. Drag rectangles on the preview, choose each fill, and optionally adjust the mosaic block size. Original RGBA pixels are saved for every region. Overlapping regions are filled in list order, while their saved pixels always come from the original image.

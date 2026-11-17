@@ -161,7 +161,9 @@ function setBusy(value) {
   $('restore').disabled = value || !image || !image.detected;
   $('selection-overlay').classList.toggle('locked', value || !regionsEditable());
   for (const input of $('region-list').querySelectorAll('input,select,button')) input.disabled = value || !regionsEditable();
+  for (const row of $('region-list').children) row.classList.toggle('clickable-row', !value && regionsEditable());
   for (const input of $('difference-list').querySelectorAll('button,select')) input.disabled = value;
+  for (const row of $('difference-list').children) row.classList.toggle('clickable-row', !value);
   $('edit-base').disabled = value || !image;
   for (const button of $('attachment-list').querySelectorAll('button')) button.disabled = value || button.dataset.unavailable === 'true';
   for (const row of $('attachment-list').children) row.draggable = !value;
@@ -359,10 +361,15 @@ function editDifference(id) {
   if (activeDifference()) $('preview').src = activeDifference().previewURL; else if (sourceURL) $('preview').src = sourceURL;
   renderDifferences(); updateCreationView();
 }
+function isRowControl(target) {
+  return Boolean(target.closest?.('button, input, select, textarea, option, a, label, summary, [role="button"], [contenteditable]'));
+}
 function renderDifferences() {
   $('difference-list').replaceChildren();
   differences.forEach((node, index) => {
     const row = document.createElement('li'); row.classList.toggle('active-difference', node.id === activeDifferenceId);
+    row.classList.toggle('clickable-row', !busy);
+    row.addEventListener('click', event => { if (!busy && !isRowControl(event.target)) editDifference(node.id); });
     const thumb = document.createElement('img'); thumb.src = node.previewURL; thumb.alt = node.name;
     const fields = document.createElement('div'), title = document.createElement('strong'); title.textContent = `${index + 1}. ${node.name}`; fields.append(title);
     const parentLabel = document.createElement('label'); parentLabel.textContent = '父本 ';
@@ -517,6 +524,8 @@ function renderRegions() {
   $('region-list').replaceChildren(); $('region-count').textContent = `${regions.length} 个选区`; $('no-regions').hidden = regions.length !== 0;
   regions.forEach((r, index) => {
     const row = document.createElement('li'), title = document.createElement('div'); title.className = 'region-title'; row.classList.toggle('selected-region', index === selectedIndex);
+    row.classList.toggle('clickable-row', !busy && regionsEditable());
+    row.addEventListener('click', event => { if (!busy && regionsEditable() && !isRowControl(event.target)) selectRegion(index); });
     const label = document.createElement('strong'); label.textContent = `选区 ${index + 1}`; title.append(label);
     const select = document.createElement('select'); select.setAttribute('aria-label', `选区 ${index + 1} 填充方式`);
     for (const [value, text] of [['mosaic', '马赛克'], ['white', '纯白'], ['black', '纯黑']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; select.append(option); }
@@ -628,9 +637,25 @@ $('toggle-results').onclick = () => setResultsOpen($('capacity-details').hidden)
 $('add-attachments').onclick = () => $('attachment-files').click();
 $('attachment-files').onchange = event => { addAttachments([...event.target.files]); event.target.value = ''; };
 $('file').onchange = event => { openFile(event.target.files[0]); event.target.value = ''; };
-for (const name of ['dragenter', 'dragover']) document.addEventListener(name, event => { event.preventDefault(); $('dropzone').classList.add('dragover'); });
-document.addEventListener('dragleave', () => $('dropzone').classList.remove('dragover'));
-document.addEventListener('drop', event => { event.preventDefault(); $('dropzone').classList.remove('dragover'); if (!dragAttachmentId) openFile(event.dataTransfer.files[0]); });
+const imagePreviewPanel = $('image-preview-panel');
+let previewDragDepth = 0;
+function isFileDrag(event) { return Array.from(event.dataTransfer?.types || []).includes('Files') || Boolean(event.dataTransfer?.files?.length); }
+function clearPreviewDrag() { previewDragDepth = 0; imagePreviewPanel.classList.remove('dragover'); $('dropzone').classList.remove('dragover'); }
+for (const name of ['dragenter', 'dragover']) imagePreviewPanel.addEventListener(name, event => {
+  if (!isFileDrag(event) || dragAttachmentId) return;
+  event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'copy';
+  if (name === 'dragenter') previewDragDepth++;
+  imagePreviewPanel.classList.add('dragover'); $('dropzone').classList.add('dragover');
+});
+imagePreviewPanel.addEventListener('dragleave', () => { if (previewDragDepth > 0 && --previewDragDepth === 0) clearPreviewDrag(); });
+imagePreviewPanel.addEventListener('drop', event => {
+  if (!isFileDrag(event) || dragAttachmentId) return;
+  event.preventDefault(); event.stopPropagation(); clearPreviewDrag(); openFile(event.dataTransfer.files[0]);
+});
+// Outside the preview, reject file drops without opening/navigating to the file.
+document.addEventListener('dragover', event => { if (isFileDrag(event)) { event.preventDefault(); event.dataTransfer.dropEffect = 'none'; } });
+document.addEventListener('drop', event => { if (isFileDrag(event)) { event.preventDefault(); clearPreviewDrag(); } });
+document.addEventListener('dragend', clearPreviewDrag);
 $('cancel').onclick = () => { if (worker) worker.terminate(); worker = null; clearTimeout(pendingPreview); ++request; taskId = loadId = 0; image = null; regions = []; coverRegions = regions; selectedIndex = -1; clearDifferences(); resultCache.clear(); clearAttachments(); renderRegions(); setBusy(false); $('state').textContent = '已取消'; $('dimensions').textContent = '请重新选择'; status('计算已取消。请重新选择图片以开始新的处理。', false, 0); };
 window.addEventListener('beforeunload', () => { if (worker) worker.terminate(); if (sourceURL) URL.revokeObjectURL(sourceURL); if (previewURL) URL.revokeObjectURL(previewURL); for (const item of [...attachments, ...differences]) URL.revokeObjectURL(item.previewURL); for (const url of outputURLs) URL.revokeObjectURL(url); });
 window.addEventListener('resize', () => { if (image) renderOverlay(); });
