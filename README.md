@@ -18,7 +18,7 @@ The resulting PNG can restore the original image, the base image **i2**, a whole
 - Automatic ImgSteg v1/v2/v3 detection and recovery of the original image, i2, derived images, ordered attachments, and text.
 - Export verification: the generated PNG is read back and its recovered contents are compared byte for byte before a successful result is shown.
 - Remaining capacity in bits, bytes, equivalent RGB pixels, and maximum exact-aspect RAW dimensions for 1:1, 4:3, and 16:9.
-- A compact floating capacity/progress dock, expandable results, sticky mode navigation, and light/dark/system themes with an adjustable hue (default: 270°).
+- A compact floating capacity/progress dock that shows remaining whole bytes by default, with the exact remaining bit count in expandable details; sticky mode navigation and light/dark/system themes with an adjustable hue (default: 270°).
 - Cached calculation results and compressed blocks. Selecting a region, switching previews, or adjusting the theme does not recompress unchanged content.
 
 ## Try it

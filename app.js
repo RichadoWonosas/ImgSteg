@@ -168,9 +168,9 @@ function setBusy(value) {
 }
 function resetMetrics() {
   displayedKey = ''; displayedAction = ''; $('payload-summary').textContent = '等待计算';
-  $('remaining').innerHTML = '— <small>bit</small>'; $('remaining').classList.remove('error');
+  $('remaining').innerHTML = '— <small>byte</small>'; $('remaining').classList.remove('error');
   for (const id of ['bytes', 'pixels', 'method']) $(id).textContent = '—';
-  for (const id of ['original', 'compressed']) $(id).textContent = '— bit';
+  for (const id of ['original', 'compressed', 'remaining-bits']) $(id).textContent = '— bit';
   for (const name of ['square', 'standard', 'wide']) { $(`raw-${name}-size`).textContent = '— × —'; $(`raw-${name}-pixels`).textContent = '— 像素'; }
   $('compression-details').replaceChildren(); $('download').disabled = true; $('download').onclick = null;
 }
@@ -186,10 +186,11 @@ function save(url, name) { const a = document.createElement('a'); a.href = url; 
 function attachDownload(id, blob, name) { const url = outputURL(blob); $(id).href = url; $(id).download = name; return url; }
 function showMetrics(w, h, bytes, method, note) {
   const m = codec.metrics(w, h, bytes);
-  $('remaining').replaceChildren(document.createTextNode(format(m.r) + ' '));
-  const unit = document.createElement('small'); unit.textContent = 'bit'; $('remaining').append(unit);
+  $('remaining').replaceChildren(document.createTextNode(format(m.b) + ' '));
+  const unit = document.createElement('small'); unit.textContent = 'byte'; $('remaining').append(unit);
   $('remaining').classList.toggle('error', m.r < 0n);
   $('bytes').textContent = format(m.b); $('pixels').textContent = format(m.pixels);
+  $('remaining-bits').textContent = `${format(m.r)} bit`;
   $('original').textContent = `${format(m.original)} bit`; $('compressed').textContent = `${format(m.n)} bit`; $('method').textContent = method;
   codec.rawSizes(m.pixels).forEach((size, i) => { const name = ['square', 'standard', 'wide'][i]; $(`raw-${name}-size`).textContent = `${format(size.width)} × ${format(size.height)}`; $(`raw-${name}-pixels`).textContent = `${format(size.pixels)} 像素`; });
   $('result-note').textContent = note;
