@@ -4,3 +4,6 @@ tests/
 
 # Ignore directories whose names begin with a dot, at any depth.
 .*/
+
+# Keep GitHub configuration directories available for version control.
+!.github/

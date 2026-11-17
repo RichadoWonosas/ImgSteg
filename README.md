@@ -152,7 +152,7 @@ Algorithm IDs: 0=raw, 1=deflate-raw, 2=deflate, 3=gzip, 4=brotli, 5=zstd. Raw st
 
 GitHub Pages publishes the repository root from `main`. `.nojekyll` enables direct static-file serving; no build workflow or `.github` directory is needed.
 
-`.gitignore` excludes `test/`, `tests/`, and directories beginning with `.` at every level. Local test suites, generated fixtures, screenshots, and publishing helpers are intentionally absent from the published repository and site. Dotfiles such as `.gitignore` and `.nojekyll` remain tracked.
+`.gitignore` excludes `test/`, `tests/`, and directories beginning with `.` at every level, with an explicit exception for `.github/` so GitHub configuration can be versioned. Local test suites, generated fixtures, screenshots, and publishing helpers are intentionally absent from the published repository and site. Dotfiles such as `.gitignore` and `.nojekyll` remain tracked.
 
 The local development copy includes 45 dependency-free tests covering codecs, PNG filters, transparent pixels, export/read-back, overlap restoration, text and attachment ordering, exact capacity, malformed payloads, geometry constraints, and v1/v2 compatibility. If that local `tests/` directory is present, run with Node.js 22+:
 
