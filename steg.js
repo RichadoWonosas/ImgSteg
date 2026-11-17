@@ -4,6 +4,14 @@ function ImgSteg() {
   const low = LsbCodec(), MAGIC = [73, 77, 71, 83, 84, 69, 71, 49], HEADER = 48;
   const MAX_PIXELS = 40000000, MAX_REGIONS = 64, MAX_TEXT = 4 * 1024 * 1024;
   const MAX_ATTACHMENTS = 32, MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024;
+  const diffCodec = typeof DiffCodec === 'function' ? DiffCodec() : null;
+  const compressedCache = new Map(); let cachedOriginal, cachedCRC, compressedBytes = 0, cacheHits = 0;
+  async function remembered(key, producer) {
+    if (compressedCache.has(key)) { cacheHits++; return compressedCache.get(key); }
+    const result = await producer(); compressedCache.set(key, result); compressedBytes += result.bytes.length;
+    while (compressedCache.size > 48 || (compressedBytes > 32 * 1024 * 1024 && compressedCache.size > 1)) { const first = compressedCache.keys().next().value; compressedBytes -= compressedCache.get(first).bytes.length; compressedCache.delete(first); }
+    return result;
+  }
   const modes = ['mosaic', 'white', 'black'];
   const byteLayouts = ['逐像素', '通道分离', '横向差分', '纵向差分', '位平面'];
   const viewOf = bytes => new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -148,47 +156,60 @@ function ImgSteg() {
     if (rgba.length !== w * h * 4) throw new Error('载体像素长度无效');
     if (w * h * 9 < HEADER * 8) return { detected: false };
     const bytes = readCarrier(rgba, HEADER), v = viewOf(bytes);
-    if (!equal(bytes.subarray(0, 7), new Uint8Array(MAGIC.slice(0, 7))) || ![49, 50].includes(bytes[7])) return { detected: false };
-    const version = bytes[7] - 48, header = version === 2 ? 56 : HEADER;
+    if (!equal(bytes.subarray(0, 7), new Uint8Array(MAGIC.slice(0, 7))) || ![49, 50, 51].includes(bytes[7])) return { detected: false };
+    const version = bytes[7] - 48, header = version === 3 ? 64 : version === 2 ? 56 : HEADER;
     const length = v.getUint32(8), count = v.getUint32(20);
     if (length < header || length * 8 > w * h * 9 || v.getUint32(12) !== w || v.getUint32(16) !== h || count > MAX_REGIONS || v.getUint32(44) > MAX_TEXT + 20) throw new Error('发现 ImgSteg 标记，但文件头损坏或尺寸已改变');
     let attachmentCount = 0, attachmentLength = 0;
-    if (version === 2) {
+    let diffCount = 0, diffLength = 0;
+    if (version >= 2) {
       const extra = viewOf(readCarrier(rgba, header)); attachmentCount = extra.getUint32(48); attachmentLength = extra.getUint32(52);
       if (attachmentCount > MAX_ATTACHMENTS || attachmentLength > length - header || (attachmentCount === 0) !== (attachmentLength === 0)) throw new Error('附加图片计数或长度无效');
+      if (version === 3) { diffCount = extra.getUint32(56); diffLength = extra.getUint32(60); if (!diffCount || diffCount > 16 || diffCount * w * h > MAX_PIXELS || diffLength < 20 || diffLength > length - header) throw new Error('差分图区段长度或数量无效'); }
     }
-    return { detected: true, length, count, version, header, attachmentCount, attachmentLength };
+    return { detected: true, length, count, version, header, attachmentCount, attachmentLength, diffCount, diffLength };
   }
-  async function build(original, w, h, regions, text = '', blockSize = 12, report = () => {}, attachments = []) {
+  async function build(original, w, h, regions, text = '', blockSize = 12, report = () => {}, attachments = [], differences = []) {
     validateAttachments(attachments);
-    const header = attachments.length ? 56 : HEADER;
+    if (differences.length && !diffCodec) throw new Error('当前环境未加载差分图解码器');
+    const originalCRC = low.crc(original);
+    if (cachedOriginal !== original || cachedCRC !== originalCRC) { compressedCache.clear(); compressedBytes = 0; cachedOriginal = original; cachedCRC = originalCRC; }
+    cacheHits = 0;
+    const header = differences.length ? 64 : attachments.length ? 56 : HEADER;
+    const baseKey = `${w},${h},${blockSize}:` + JSON.stringify(regions);
     const base = makeBase(original, w, h, regions, blockSize);
     const textData = new TextEncoder().encode(text);
     if (new TextDecoder('utf-8', { ignoreBOM: true }).decode(textData) !== text) throw new Error('附加文字包含无效的 Unicode 字符，请修改后重试');
     if (textData.length > MAX_TEXT) throw new Error('附加文字 UTF-8 长度最多为 4 MiB');
     const parts = [], methods = [];
-    const stage = (index, label) => update => report({ progress: 5 + 80 * (index + update.progress / 100) / (regions.length + attachments.length + 3), message: `${label}：${update.message}` });
-    const lsb = await low.encode(low.extract(base), w, h, stage(0, '压缩 i2 的低 3 位'));
+    const stage = (index, label) => update => report({ progress: 5 + 80 * (index + update.progress / 100) / (regions.length + attachments.length + (differences.length ? 1 : 0) + 3), message: `${label}：${update.message}` });
+    const lsb = await remembered(`low:${baseKey}`, () => low.encode(low.extract(base), w, h, stage(0, '压缩 i2 的低 3 位')));
     parts.push(lsb.bytes); methods.push({ label: 'i2 LSB3', method: lsb.method, bytes: lsb.bytes.length });
     let alpha = new Uint8Array(w * h); let opaque = true;
     for (let p = 0; p < alpha.length; p++) { alpha[p] = base[p * 4 + 3]; if (alpha[p] !== 255) opaque = false; }
     let alphaLength = 0;
     if (!opaque) {
-      const block = await encodeBytes(alpha, w, h, 1, stage(1, '压缩透明通道'));
+      const block = await remembered(`alpha:${baseKey}`, () => encodeBytes(alpha, w, h, 1, stage(1, '压缩透明通道')));
       parts.push(block.bytes); alphaLength = block.bytes.length; methods.push({ label: 'i2 Alpha', method: block.method, bytes: alphaLength });
     }
     alpha = null;
     for (let index = 0; index < regions.length; index++) {
       const r = regions[index], data = crop(original, w, r);
-      const block = await encodeBytes(data, r.w, r.h, 4, stage(index + 2, `压缩选区 ${index + 1} 的完整 RGBA`));
+      const block = await remembered(`region:${r.x},${r.y},${r.w},${r.h}`, () => encodeBytes(data, r.w, r.h, 4, stage(index + 2, `压缩选区 ${index + 1} 的完整 RGBA`)));
       const record = new Uint8Array(24), v = viewOf(record);
       v.setUint32(0, r.x); v.setUint32(4, r.y); v.setUint32(8, r.w); v.setUint32(12, r.h); record[16] = modes.indexOf(r.mode); v.setUint32(20, block.bytes.length);
       parts.push(record, block.bytes); methods.push({ label: `选区 ${index + 1}`, method: block.method, bytes: block.bytes.length });
     }
+    let diffLength = 0;
+    if (differences.length) {
+      const block = await diffCodec.encode(differences, regions.length ? base : original, w, h, encodeBytes, stage(regions.length + 2, '压缩差分图'));
+      parts.push(block.bytes); diffLength = block.bytes.length; methods.push(...block.methods);
+    }
     let attachmentLength = 0;
     for (let index = 0; index < attachments.length; index++) {
       const item = attachments[index], name = new TextEncoder().encode(item.name), type = new TextEncoder().encode(item.type);
-      const block = await encodeBytes(item.data, item.data.length, 1, 1, stage(regions.length + 2 + index, `压缩附加图片 ${index + 1}`));
+      const produce = () => encodeBytes(item.data, item.data.length, 1, 1, stage(regions.length + 2 + (differences.length ? 1 : 0) + index, `压缩附加图片 ${index + 1}`));
+      const block = item.cacheId ? await remembered(`attachment:${item.cacheId}`, produce) : await produce();
       const record = new Uint8Array(16 + name.length + type.length), rv = viewOf(record);
       rv.setUint16(0, name.length); rv.setUint16(2, type.length); rv.setUint32(4, block.bytes.length); rv.setUint32(8, item.w); rv.setUint32(12, item.h);
       record.set(name, 16); record.set(type, 16 + name.length); parts.push(record, block.bytes); attachmentLength += record.length + block.bytes.length;
@@ -202,7 +223,8 @@ function ImgSteg() {
     const length = header + parts.reduce((sum, p) => sum + p.length, 0), bytes = new Uint8Array(length), v = viewOf(bytes);
     bytes.set(MAGIC); v.setUint32(8, length); v.setUint32(12, w); v.setUint32(16, h); v.setUint32(20, regions.length);
     v.setUint32(24, lsb.bytes.length); v.setUint32(28, alphaLength); v.setUint32(32, low.crc(base)); v.setUint32(36, low.crc(original)); v.setUint32(44, textLength);
-    if (attachments.length) { bytes[7] = 50; v.setUint32(48, attachments.length); v.setUint32(52, attachmentLength); }
+    if (attachments.length || differences.length) { bytes[7] = differences.length ? 51 : 50; v.setUint32(48, attachments.length); v.setUint32(52, attachmentLength); }
+    if (differences.length) { v.setUint32(56, differences.length); v.setUint32(60, diffLength); }
     let offset = header;
     for (const part of parts) { bytes.set(part, offset); offset += part.length; }
     v.setUint32(40, low.crc(bytes.subarray(header)));
@@ -213,8 +235,9 @@ function ImgSteg() {
       carrier = embed(base, bytes);
       const restored = await restore(carrier, w, h);
       if (!equal(restored.original, original) || !equal(restored.base, base) || restored.text !== text || !sameAttachments(restored.attachments, attachments)) throw new Error('隐写端到端往返验证失败');
+      if (differences.length !== restored.differences.length || differences.some((node, index) => !equal(node.rgba, restored.differences[index].rgba))) throw new Error('差分图往返验证失败');
     }
-    return { fits, bytes, carrier, base, methods, w, h, textBytes: textData.length, attachmentCount: attachments.length };
+    return { fits, bytes, carrier, base, methods, w, h, textBytes: textData.length, attachmentCount: attachments.length, cacheHits };
   }
   async function restore(carrier, w, h, report = () => {}) {
     const info = probe(carrier, w, h);
@@ -249,6 +272,13 @@ function ImgSteg() {
       if (block.w !== r.w || block.h !== r.h || block.channels !== 4) throw new Error('选区 RGBA 数据尺寸不匹配');
       paste(original, w, r, block.data);
     }
+    let differences = [];
+    if (info.diffCount) {
+      if (!diffCodec) throw new Error('当前环境未加载差分图解码器');
+      report({ progress: 75, message: '正在沿父本路径恢复差分图…' });
+      differences = await diffCodec.decode(take(info.diffLength), base, w, h, decodeBytes);
+      if (differences.length !== info.diffCount) throw new Error('差分图计数不匹配');
+    }
     const attachments = [], attachmentStart = offset;
     let attachmentBytes = 0;
     for (let index = 0; index < info.attachmentCount; index++) {
@@ -274,7 +304,7 @@ function ImgSteg() {
     if (offset !== bytes.length) throw new Error('隐写内容包含未定义的尾部数据');
     if (low.crc(original) !== v.getUint32(36)) throw new Error('恢复的原图校验失败');
     report({ progress: 90, message: '原图、i2 和文字均已通过校验' });
-    return { detected: true, original, base, text, regions, attachments, version: info.version, w, h, length: bytes.length };
+    return { detected: true, original, base, text, regions, attachments, differences, version: info.version, w, h, length: bytes.length };
   }
   return { build, restore, probe, embed, readCarrier, makeBase, crop, fill, encodeBytes, decodeBytes, byteTransform, validateRegions, validateAttachments, sameAttachments, modes, equal };
 }

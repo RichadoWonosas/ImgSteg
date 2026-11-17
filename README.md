@@ -4,7 +4,7 @@
 
 Reversible image steganography, entirely in your browser. Cover selected areas with mosaic, white, or black, then store the recovery data, additional images, and a text message inside the image's three least significant RGB bits.
 
-The resulting PNG can restore both the original image and the covered base image **i2**, along with all attached files and text. No backend, framework, CDN, package installation, or build step is required. Image and message processing runs locally in a Web Worker.
+The resulting PNG can restore the original image, the base image **i2**, a whole tree of derived difference images, attached files, and text. No backend, framework, CDN, package installation, or build step is required. Image and message processing runs locally in a Web Worker.
 
 ## Features
 
@@ -14,9 +14,12 @@ The resulting PNG can restore both the original image and the covered base image
 - Multiple attached images, preserving their original file bytes, names, formats, metadata, and animations. Reorder them by dragging or using the move buttons.
 - UTF-8 messages, including newlines, Chinese, emoji, a leading BOM, and NUL characters.
 - Independent compression selection for each block, with precise capacity accounting and a raw-storage fallback.
-- Automatic ImgSteg v1/v2 detection and recovery of the original image, i2, ordered attachments, and text.
+- Difference-image families with arbitrary acyclic parent relationships, including parents uploaded later. Each image supports automatic boxes (at most 10), manual boxes with exact coverage validation, or full-image XOR.
+- Automatic ImgSteg v1/v2/v3 detection and recovery of the original image, i2, derived images, ordered attachments, and text.
 - Export verification: the generated PNG is read back and its recovered contents are compared byte for byte before a successful result is shown.
 - Remaining capacity in bits, bytes, equivalent RGB pixels, and maximum exact-aspect RAW dimensions for 1:1, 4:3, and 16:9.
+- A compact floating capacity/progress dock, expandable results, sticky mode navigation, and light/dark/system themes with an adjustable hue (default: 270°).
+- Cached calculation results and compressed blocks. Selecting a region, switching previews, or adjusting the theme does not recompress unchanged content.
 
 ## Try it
 
@@ -29,7 +32,29 @@ Open the [live demo](https://richadowonosas.github.io/ImgSteg/), or download thi
 5. Click **计算并生成隐写 PNG** (calculate and generate). A PNG is produced only if the complete payload fits. If it does not, reduce the selected areas, attachments, or text, or choose another carrier. The covered i2 image remains downloadable.
 6. In **识别与还原** (detect and restore), select the exported PNG. The page detects the format, verifies the contents, and provides the original image, i2, attached files in order, and a TXT download. You can also restore a newly generated PNG directly on the same page.
 
-The interface is currently in Simplified Chinese. **仅分析 i2 低位** performs the original low-bit-only analysis; its payload size excludes regions, attachments, text, and the outer steganography container. The full generation action includes all of them.
+The interface is currently in Simplified Chinese. **仅分析 i2 低位** performs the original low-bit-only analysis; its payload size excludes regions, difference images, attachments, text, and the outer container. The full generation action includes all of them. Expand **容量与结果** in the bottom dock to inspect details, previews, and downloads; the quick PNG download stays visible after generation.
+
+### Difference images
+
+After loading a base image, choose **差分图隐写** in the creation-type selector. The base itself is the visible i2 image and is not covered or redrawn. Upload same-size derived images, then choose each image's parent. Every parent chain must end at i2; self-parenting, missing parents, and cycles are rejected. Forward references are supported. Removing a parent reconnects its direct children to the base and invalidates their coverage information.
+
+Each image can use:
+
+- **自动框选**: generate up to 10 rectangles covering every different pixel.
+- **手动框选**: draw/edit rectangles with the existing editor. The image is dimmed by 50%, and changed RGBA pixels are marked white (`#FFFFFF`). After the first rectangle, still-uncovered changed pixels appear pale red (`#FFDDDD`). Packing is refused until coverage is complete.
+- **全图 XOR**: XOR all RGBA samples against the parent and compress the result as one full-frame block. No manual selection is needed. Sparse differences can compress well even in this simplest mode.
+
+Differences are exact 8-bit RGBA comparisons, including Alpha and hidden RGB values supported by direct PNG decoding. A difference image restores decoded pixels as a new PNG, rather than the source file's original encoding or metadata. Use ordinary attachments when exact original file bytes are needed.
+
+Automatic selection follows connected-component bounding-box analysis, as described in the [OpenCV shape documentation](https://docs.opencv.org/4.5.4/d3/dc0/group__imgproc__shape.html), implemented here without OpenCV or other dependencies. An adaptive grid of at most 256×256 cells retains exact extrema of changed pixels, eight-connected components yield initial boxes, and excessive components are grouped spatially using Morton order. Greedy merging minimizes the additional bounding area of each pair until at most 10 remain. This bounded heuristic guarantees coverage, not globally minimal area or optimal compression.
+
+Selected rectangles store parent/child XOR bytes, independently compressed with B8C1. Reconstruction always XORs against the unchanged parent, so overlapping rectangles do not cancel data. Images are reconstructed in topological order and checked against each image's RGBA CRC-32. Storage order still follows upload order, and parents may refer forward.
+
+### Theme and result caching
+
+**主题设置** controls light, dark, or system-following appearance and a 0–360° hue, defaulting to 270°. Preferences are local to the browser origin and do not alter image bytes. Only the essential capacity summary and progress remain permanently visible; the full result panel is collapsible.
+
+The page retains the last full-generation and low-bit-analysis results. Repeating an identical request returns the saved blobs and metrics. Keys include carrier lifetime, regions/fills, mosaic size, difference parents/policies/manual boxes, attachments/order, and text. Presentation-only changes are excluded. The Worker also reuses unchanged i2 low-bit/Alpha blocks, saved original regions, attached-file blocks, and XOR patches when other content changes. New carriers and cancellation clear the cache. Compression-block caches are bounded by entry count/bytes; no cache is persisted to disk.
 
 ## How it works
 
@@ -87,6 +112,8 @@ The exported carrier is opaque. Original/i2 Alpha values are recovered from the 
 | Total selected area | 40 million pixels, counting overlaps repeatedly |
 | Attached image files | 32 |
 | Combined original attachment file size | 32 MiB |
+| Difference images | 16, each the same size as i2; 40 million pixels combined |
+| Difference selection | At most 10 automatic boxes, or 64 manual boxes per image |
 | UTF-8 message | 4 MiB; the interface allows up to 1 million UTF-16 code units |
 
 Available payload capacity can be much lower than these input limits. Large inputs can still exhaust device memory. Candidate compression runs sequentially in a Worker. Changing the carrier or cancelling terminates the Worker and clears the attachment list; choose the image again to restart.
@@ -98,10 +125,11 @@ Available payload capacity can be much lower than these input limits. Large inpu
 All integers use big-endian byte order. The payload is self-describing; decoding needs the format implementation and a supported decompressor, but no original image or external sidecar file.
 
 ```text
-IMGSTEG1 header (48 bytes), or IMGSTEG2 header (56 bytes)
+IMGSTEG1 header (48 bytes), IMGSTEG2 (56 bytes), or IMGSTEG3 (64 bytes)
 i2 RGB low-bit block (L3B1)
 optional i2 Alpha block (B8C1)
 region record + original RGBA block (B8C1), repeated in selection order
+optional difference-image section (DIF1), including its parent graph and XOR blocks
 attachment record + original file-byte block (B8C1), repeated in attachment order
 optional UTF-8 message block (B8C1), always last
 ```
@@ -121,10 +149,16 @@ optional UTF-8 message block (B8C1), always last
 | 36 | 4 | CRC-32 of complete original RGBA bytes |
 | 40 | 4 | CRC-32 of all bytes after the actual container header |
 | 44 | 4 | Final text block length; zero means no text |
-| 48 | 4 | v2 only: attachment count |
-| 52 | 4 | v2 only: total attachment section length, including records |
+| 48 | 4 | v2/v3: attachment count |
+| 52 | 4 | v2/v3: total attachment section length, including records |
+| 56 | 4 | v3 only: difference-image count |
+| 60 | 4 | v3 only: complete DIF1 section length |
 
-No attachments means a v1 container. Attachments enable v2. The current reader supports both versions; older v1-only implementations cannot decode v2.
+With no difference images, no attachments means v1 and attachments enable v2. Difference images enable v3; v3 retains the attachment fields at offsets 48/52 even when there are no attachments. The body CRC starts after the actual 48/56/64-byte header. The current reader supports all three versions; older readers cannot decode newer versions.
+
+### DIF1 section
+
+The section begins with 20 bytes: `DIF1`, image count, width, height, and i2 RGBA CRC-32 (all following fields uint32). Each upload-order image has a 16-byte record: UTF-8 name length (uint16), patch count (uint16), parent index (uint32, 0=i2, 1-based upload order otherwise), child RGBA CRC-32 (uint32), reserved zero (uint32); then the filename bytes. Each patch has five uint32 values for X/Y/width/height/B8C1 length, followed by its RGBA XOR B8C1 block. An identical auto-mode image can have zero patches; full-image XOR has one full-frame patch. Graph reachability, cycles, dimensions, lengths, coverage on encoding, and reconstructed image CRCs are validated.
 
 A region record is 24 bytes: X/Y/width/height as four uint32 values; one fill byte (0=mosaic, 1=white, 2=black); three zero reserved bytes; and a uint32 block length.
 
@@ -149,12 +183,13 @@ Algorithm IDs: 0=raw, 1=deflate-raw, 2=deflate, 3=gzip, 4=brotli, 5=zstd. Raw st
 | `steg.js` | Full-byte codecs, v1/v2 containers, embedding and restoration |
 | `png.js` | Lossless PNG reading and writing |
 | `editor.js` | Hit testing, constrained movement and eight-direction resizing |
+| `diff.js` | Parent graphs, masks, bounded automatic boxes, coverage previews and XOR patch sections |
 
 GitHub Pages publishes the repository root from `main`. `.nojekyll` enables direct static-file serving; no build workflow or `.github` directory is needed.
 
 `.gitignore` excludes `test/`, `tests/`, and directories beginning with `.` at every level, with an explicit exception for `.github/` so GitHub configuration can be versioned. Local test suites, generated fixtures, screenshots, and publishing helpers are intentionally absent from the published repository and site. Dotfiles such as `.gitignore` and `.nojekyll` remain tracked.
 
-The local development copy includes 45 dependency-free tests covering codecs, PNG filters, transparent pixels, export/read-back, overlap restoration, text and attachment ordering, exact capacity, malformed payloads, geometry constraints, and v1/v2 compatibility. If that local `tests/` directory is present, run with Node.js 22+:
+The local development copy includes 54 dependency-free tests covering codecs, PNG filters, transparent pixels, export/read-back, overlap restoration, text/attachment/difference ordering, exact capacity, malformed payloads, geometry constraints, forward-reference DAGs, all three XOR policies, coverage, caches, and v1/v2/v3 compatibility. If that local `tests/` directory is present, run with Node.js 22+:
 
 ```sh
 node --test tests/*.test.cjs

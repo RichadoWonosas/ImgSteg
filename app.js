@@ -2,14 +2,29 @@
 const $ = id => document.getElementById(id), codec = LsbCodec();
 const format = n => n.toLocaleString('zh-CN'), svgNS = 'http://www.w3.org/2000/svg';
 const rectEditor = RectEditor();
+const differenceEngine = DiffCodec();
 let worker, image, mode = 'encode', regions = [], revision = 0, busy = false, pendingPreview, drag;
 let selectedIndex = -1, selectedPart = 'move', attachments = [], dragAttachmentId = null;
+let creationKind = 'cover', coverRegions = regions, differences = [], activeDifferenceId = null;
+let taskKey = '', displayedKey = '', displayedAction = '';
+const resultCache = new Map();
 let request = 0, taskId = 0, loadId = 0, sourceURL, previewURL;
 const outputURLs = new Set();
 function workerMain() {
-  const codec = LsbCodec(), steg = ImgSteg(), png = PngCodec();
+  const codec = LsbCodec(), steg = ImgSteg(), png = PngCodec(), diff = DiffCodec();
   let image;
   const attachedFiles = new Map();
+  const differenceFiles = new Map();
+  let lowKey = '', lowResult;
+  function differenceNodes(metadata) {
+    diff.graph(metadata);
+    if (metadata.length * image.w * image.h > 40000000) throw new Error('差分图合计最多支持 4000 万像素');
+    return metadata.map(node => {
+      const entry = differenceFiles.get(node.id);
+      if (!entry) throw new Error('差分图数据已失效，请重新上传');
+      return { ...node, name: entry.name, rgba: entry.rgba };
+    });
+  }
   async function load(file) {
     const bytes = new Uint8Array(await file.arrayBuffer());
     let result = await png.decode(bytes);
@@ -48,7 +63,27 @@ function workerMain() {
       }
       if (!image) throw new Error('请先上传图片');
       const { rgba, w, h } = image;
-      if (action === 'attachments') {
+      if (action === 'diff-upload') {
+        if (differenceFiles.size + message.files.length > 16 || (differenceFiles.size + message.files.length) * w * h > 40000000) throw new Error('最多 16 张差分图，合计最多 4000 万像素');
+        const items = [];
+        for (const [index, file] of message.files.entries()) {
+          progress({ progress: index / message.files.length * 100, message: `正在读取差分图 ${index + 1}…` });
+          const decoded = await load(file);
+          if (decoded.w !== w || decoded.h !== h) throw new Error(`差分图「${file.name}」必须与基底图尺寸 ${w} × ${h} 相同`);
+          if (!file.name || new TextEncoder().encode(file.name).length > 1024) throw new Error('差分图名称过长或无效');
+          items.push({ id: `diff-${id}-${index}`, name: file.name, rgba: decoded.rgba, w, h, previewBlob: await png.encode(decoded.rgba, w, h) });
+        }
+        for (const item of items) differenceFiles.set(item.id, item);
+        self.postMessage({ id, action, done: true, items: items.map(({ rgba, ...item }) => item) });
+      } else if (action === 'forget-difference') differenceFiles.delete(message.differenceId);
+      else if (action === 'diff-preview') {
+        const nodes = differenceNodes(message.differences), node = nodes.find(item => item.id === message.nodeId);
+        if (!node) throw new Error('请选择差分图');
+        const parent = node.parentId === 'base' ? rgba : nodes.find(item => item.id === node.parentId).rgba;
+        const analysis = diff.analyze(parent, node.rgba, w, h), boxes = node.policy === 'full' ? [{ x: 0, y: 0, w, h }] : node.policy === 'auto' ? analysis.boxes : node.regions;
+        const result = diff.preview(node.rgba, analysis, w, h, boxes);
+        self.postMessage({ id, action, done: true, revision: message.revision, nodeId: node.id, boxes, count: analysis.count, missing: result.missing, blob: await png.encode(result.rgba, w, h) });
+      } else if (action === 'attachments') {
         const items = [];
         if (attachedFiles.size + message.files.length > 32) throw new Error('最多附加 32 张图片');
         let total = [...attachedFiles.values()].reduce((sum, item) => sum + item.file.size, 0);
@@ -72,7 +107,9 @@ function workerMain() {
         self.postMessage({ id, action, done: true, revision: message.revision, blob: await png.encode(base, w, h) });
       } else if (action === 'analyze') {
         const base = steg.makeBase(rgba, w, h, message.regions, message.blockSize);
-        const result = await codec.encode(codec.extract(base), w, h, progress);
+        const key = JSON.stringify([message.regions, message.blockSize]);
+        if (key !== lowKey || !lowResult) { lowResult = await codec.encode(codec.extract(base), w, h, progress); lowKey = key; }
+        const result = { ...lowResult, bytes: lowResult.bytes.slice() };
         self.postMessage({ id, action, done: true, w, h, ...result }, [result.bytes.buffer]);
       } else if (action === 'build') {
         const extraImages = [];
@@ -80,9 +117,10 @@ function workerMain() {
         for (const attachmentId of message.attachmentIds) {
           const item = attachedFiles.get(attachmentId);
           if (!item) throw new Error('附加图片已失效，请重新上传');
-          extraImages.push({ name: item.name, type: item.type, w: item.w, h: item.h, data: new Uint8Array(await item.file.arrayBuffer()) });
+          extraImages.push({ name: item.name, type: item.type, w: item.w, h: item.h, cacheId: item.id, data: new Uint8Array(await item.file.arrayBuffer()) });
         }
-        const result = await steg.build(rgba, w, h, message.regions, message.text, message.blockSize, progress, extraImages);
+        const variants = differenceNodes(message.differences || []);
+        const result = await steg.build(rgba, w, h, message.regions, message.text, message.blockSize, progress, extraImages, variants);
         const baseBlob = await png.encode(result.base, w, h); let carrierBlob;
         if (result.fits) {
           progress({ progress: 93, message: '正在导出无损 PNG，并从导出文件再次验证恢复…' });
@@ -90,6 +128,7 @@ function workerMain() {
           const saved = await png.decode(new Uint8Array(await carrierBlob.arrayBuffer()));
           const restored = await steg.restore(saved.rgba, w, h);
           if (!steg.equal(restored.original, rgba) || !steg.equal(restored.base, result.base) || restored.text !== message.text || !steg.sameAttachments(restored.attachments, extraImages)) throw new Error('导出 PNG 的恢复校验失败');
+          if (variants.length !== restored.differences.length || variants.some((node, index) => !steg.equal(node.rgba, restored.differences[index].rgba))) throw new Error('导出 PNG 的差分图校验失败');
         }
         self.postMessage({ id, action, done: true, w, h, fits: result.fits, bytes: result.bytes, baseBlob, carrierBlob, methods: result.methods, textBytes: result.textBytes }, [result.bytes.buffer]);
       } else if (action === 'restore') {
@@ -97,13 +136,15 @@ function workerMain() {
         if (!result.detected) { self.postMessage({ id, action, done: true, detected: false }); return; }
         const originalBlob = await png.encode(result.original, w, h), baseBlob = await png.encode(result.base, w, h);
         const extraImages = result.attachments.map(item => ({ name: item.name, type: item.type, w: item.w, h: item.h, blob: new Blob([item.data], { type: item.type }) }));
-        self.postMessage({ id, action, done: true, detected: true, w, h, text: result.text, regions: result.regions, originalBlob, baseBlob, attachments: extraImages, version: result.version, length: result.length });
+        const variants = [];
+        for (const node of result.differences) variants.push({ id: node.id, parentId: node.parentId, name: node.name, blob: await png.encode(node.rgba, w, h) });
+        self.postMessage({ id, action, done: true, detected: true, w, h, text: result.text, regions: result.regions, originalBlob, baseBlob, attachments: extraImages, differences: variants, version: result.version, length: result.length });
       }
-    } catch (error) { self.postMessage({ id, action, revision: message.revision, error: error.message || '处理失败' }); }
+    } catch (error) { self.postMessage({ id, action, revision: message.revision, nodeId: message.nodeId, error: error.message || '处理失败' }); }
   };
 }
 function makeWorker() {
-  const code = `const LsbCodec = ${LsbCodec.toString()}; const ImgSteg = ${ImgSteg.toString()}; const PngCodec = ${PngCodec.toString()}; (${workerMain.toString()})();`;
+  const code = `const LsbCodec = ${LsbCodec.toString()}; const DiffCodec = ${DiffCodec.toString()}; const ImgSteg = ${ImgSteg.toString()}; const PngCodec = ${PngCodec.toString()}; (${workerMain.toString()})();`;
   const url = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
   try { worker = new Worker(url); } finally { URL.revokeObjectURL(url); }
   worker.onmessage = event => receive(event.data);
@@ -115,14 +156,18 @@ function status(message, error = false, value) {
 }
 function setBusy(value) {
   busy = value; $('cancel').hidden = !value;
-  for (const id of ['generate', 'analyze', 'add-region', 'clear-regions', 'block-size', 'new-fill', 'extra-text', 'add-attachments', 'attachment-files']) $(id).disabled = value || !image;
+  for (const id of ['generate', 'analyze', 'block-size', 'new-fill', 'extra-text', 'add-attachments', 'attachment-files', 'add-differences', 'difference-files', 'creation-kind']) $(id).disabled = value || !image;
+  for (const id of ['add-region', 'clear-regions']) $(id).disabled = value || !regionsEditable();
   $('restore').disabled = value || !image || !image.detected;
-  $('selection-overlay').classList.toggle('locked', value);
-  for (const input of $('region-list').querySelectorAll('input,select,button')) input.disabled = value;
+  $('selection-overlay').classList.toggle('locked', value || !regionsEditable());
+  for (const input of $('region-list').querySelectorAll('input,select,button')) input.disabled = value || !regionsEditable();
+  for (const input of $('difference-list').querySelectorAll('button,select')) input.disabled = value;
+  $('edit-base').disabled = value || !image;
   for (const button of $('attachment-list').querySelectorAll('button')) button.disabled = value || button.dataset.unavailable === 'true';
   for (const row of $('attachment-list').children) row.draggable = !value;
 }
 function resetMetrics() {
+  displayedKey = ''; displayedAction = ''; $('payload-summary').textContent = '等待计算';
   $('remaining').innerHTML = '— <small>bit</small>'; $('remaining').classList.remove('error');
   for (const id of ['bytes', 'pixels', 'method']) $(id).textContent = '—';
   for (const id of ['original', 'compressed']) $(id).textContent = '— bit';
@@ -131,8 +176,8 @@ function resetMetrics() {
 }
 function clearOutputs() {
   for (const url of outputURLs) URL.revokeObjectURL(url); outputURLs.clear();
-  for (const id of ['generated', 'restored', 'decode-text-box', 'decoded-attachments-box']) $(id).hidden = true;
-  $('decoded-attachments').replaceChildren();
+  for (const id of ['generated', 'restored', 'decode-text-box', 'decoded-attachments-box', 'decoded-differences-box', 'quick-download']) $(id).hidden = true;
+  $('decoded-attachments').replaceChildren(); $('decoded-differences').replaceChildren();
   for (const id of ['steg-preview', 'original-output', 'base-output']) $(id).removeAttribute('src');
   $('decoded-text').value = '';
 }
@@ -148,11 +193,13 @@ function showMetrics(w, h, bytes, method, note) {
   $('original').textContent = `${format(m.original)} bit`; $('compressed').textContent = `${format(m.n)} bit`; $('method').textContent = method;
   codec.rawSizes(m.pixels).forEach((size, i) => { const name = ['square', 'standard', 'wide'][i]; $(`raw-${name}-size`).textContent = `${format(size.width)} × ${format(size.height)}`; $(`raw-${name}-pixels`).textContent = `${format(size.pixels)} 像素`; });
   $('result-note').textContent = note;
+  $('payload-summary').textContent = `${format(BigInt(bytes))} / ${format(m.original >> 3n)} byte`;
 }
 function openFile(file, demo = false) {
   if (!file && !demo) return;
   clearTimeout(pendingPreview); if (worker) worker.terminate(); worker = null;
   image = null; regions = []; drag = null; selectedIndex = -1; selectedPart = 'move'; revision++; taskId = 0;
+  coverRegions = regions; clearDifferences(); resultCache.clear();
   clearAttachments();
   resetMetrics(); clearOutputs(); renderRegions();
   if (sourceURL) URL.revokeObjectURL(sourceURL); if (previewURL) URL.revokeObjectURL(previewURL); sourceURL = previewURL = undefined;
@@ -164,6 +211,16 @@ function openFile(file, demo = false) {
   catch (error) { setBusy(false); status(error.message, true); }
 }
 function receive(data) {
+  if (data.action === 'diff-preview') {
+    if (data.revision !== revision || data.nodeId !== activeDifferenceId || creationKind !== 'difference' || mode !== 'encode') return;
+    if (data.error) { status(data.error, true); $('diff-status').textContent = data.error; return; }
+    const node = activeDifference(); if (!node) return;
+    node.count = data.count; node.missing = data.missing;
+    if (node.policy !== 'manual') { node.regions = data.boxes.map(r => ({ ...r, mode: 'mosaic' })); regions = node.regions; selectedIndex = -1; }
+    if (previewURL) URL.revokeObjectURL(previewURL); previewURL = URL.createObjectURL(data.blob); $('preview').src = previewURL;
+    $('diff-status').textContent = `差异 ${format(data.count)} 像素 · 未覆盖 ${format(data.missing)} 像素 · ${data.boxes.length} 个框`;
+    $('diff-status').classList.toggle('error', data.missing > 0); renderRegions(); setBusy(busy); return;
+  }
   if (data.action === 'preview') {
     if (data.error) { if (data.revision === revision) status(data.error, true); return; }
     if (data.done && data.revision === revision && image && mode === 'encode' && $('show-fill').checked) { if (previewURL) URL.revokeObjectURL(previewURL); previewURL = URL.createObjectURL(data.blob); $('preview').src = previewURL; }
@@ -173,17 +230,25 @@ function receive(data) {
   if (data.error) { setBusy(false); $('state').textContent = '处理失败'; status(data.error, true, 0); return; }
   if (!data.done) { status(data.message, false, data.progress); return; }
   setBusy(false);
+  if (data.action === 'build' || data.action === 'analyze') {
+    displayedKey = taskKey; displayedAction = data.action;
+    if (!data.cached) resultCache.set(data.action, { key: taskKey, data });
+  }
   if (data.action === 'load') {
     image = { w: data.w, h: data.h, detected: data.detected };
     sourceURL = URL.createObjectURL(data.blob); $('preview').src = sourceURL;
     $('preview-box').hidden = false; $('dropzone').hidden = true;
     $('selection-overlay').setAttribute('viewBox', `0 0 ${data.w} ${data.h}`);
     $('dimensions').textContent = `${format(data.w)} × ${format(data.h)} px`; $('source-info').textContent = data.source;
-    $('detection').textContent = data.detectionError || (data.detected ? (mode === 'decode' ? '发现 ImgSteg 标记，正在自动提取并校验。' : '发现 ImgSteg 标记，可切换到“识别与还原”提取内容。') : '未发现本项目的 ImgSteg v1/v2 标记。');
+    $('detection').textContent = data.detectionError || (data.detected ? (mode === 'decode' ? '发现 ImgSteg 标记，正在自动提取并校验。' : '发现 ImgSteg 标记，可切换到“识别与还原”提取内容。') : '未发现本项目的 ImgSteg v1/v2/v3 标记。');
     $('detection').classList.toggle('error', Boolean(data.detectionError));
     $('state').textContent = '就绪'; $('result-note').textContent = mode === 'decode' ? (data.detected ? '已识别隐写标记，正在提取恢复数据。' : '此图片未发现本项目的隐写格式。') : '框选区域、填写文字后，点击“计算并生成隐写 PNG”。';
     status('可在图片上拖出多个矩形选区。', false, 0); setBusy(false); renderRegions();
+    updateCreationView();
     if (mode === 'decode' && data.detected) startTask('restore');
+  } else if (data.action === 'diff-upload') {
+    for (const { previewBlob, ...item } of data.items) differences.push({ ...item, parentId: 'base', policy: 'auto', regions: [], previewURL: URL.createObjectURL(previewBlob) });
+    renderDifferences(); editDifference(data.items[0]?.id || null); changed(); status(`已添加 ${data.items.length} 张差分图，可为每张选择父本与编码方式。`, false, 100);
   } else if (data.action === 'attachments') {
     for (const item of data.items) { const { previewBlob, ...metadata } = item; attachments.push({ ...metadata, previewURL: URL.createObjectURL(previewBlob) }); }
     renderAttachments(); changed(false); status(`已按上传顺序添加 ${data.items.length} 张图片，可拖动调整顺序。`, false, 100);
@@ -191,9 +256,9 @@ function receive(data) {
     showMetrics(data.w, data.h, data.bytes.length, data.method, '仅分析 i2 的低位压缩空间，尚未计入选区、文字和隐写文件头。');
     const url = outputURL(new Blob([data.bytes], { type: 'application/octet-stream' }));
     $('download').disabled = false; $('download').textContent = '下载低位压缩内容 ↓'; $('download').onclick = () => save(url, 'i2.lsb3');
-    $('state').textContent = '分析完成'; status(`已比较 ${data.candidates} 个低位候选方案，往返校验通过。`, false, 100);
+    $('state').textContent = '分析完成'; status(data.cached ? '已复用上次低位分析结果，未重新压缩。' : `已比较 ${data.candidates} 个低位候选方案，往返校验通过。`, false, 100);
   } else if (data.action === 'build') {
-    if (mode === 'encode' && $('show-fill').checked) { if (previewURL) URL.revokeObjectURL(previewURL); previewURL = URL.createObjectURL(data.baseBlob); $('preview').src = previewURL; }
+    if (mode === 'encode' && creationKind === 'cover' && $('show-fill').checked) { if (previewURL) URL.revokeObjectURL(previewURL); previewURL = URL.createObjectURL(data.baseBlob); $('preview').src = previewURL; }
     const remaining = BigInt(data.w) * BigInt(data.h) * 9n - BigInt(data.bytes.length) * 8n;
     showMetrics(data.w, data.h, data.bytes.length, '各分块独立择优，详情见下方', data.fits ? '全部恢复数据与文字均可装入，已生成并验证隐写 PNG。' : `容量不足，超出 ${format(-remaining)} bit；请缩小选区、减少文字或更换图片。`);
     for (const item of data.methods) { const row = document.createElement('li'); row.textContent = `${item.label}：${item.method} · ${format(item.bytes)} byte`; $('compression-details').append(row); }
@@ -203,13 +268,14 @@ function receive(data) {
     $('steg-result').hidden = !data.fits; $('overflow-result').hidden = data.fits;
     if (data.fits) {
       $('steg-preview').src = attachDownload('download-steg', data.carrierBlob, 'ImgSteg-hidden.png');
+      $('quick-download').href = $('download-steg').href; $('quick-download').download = 'ImgSteg-hidden.png'; $('quick-download').hidden = false;
       $('restore-generated').onclick = () => { openFile(new File([data.carrierBlob], 'ImgSteg-hidden.png', { type: 'image/png' })); setMode('decode'); };
-      $('state').textContent = '生成成功'; status('从导出 PNG 再次提取，原图、i2、附加图片与文字全部逐字节还原。请保留 PNG 原文件。', false, 100);
+      $('state').textContent = '生成成功'; status(data.cached ? '已复用上次完整结果，配置未改变，无需重新计算。' : '已从导出 PNG 验证原图、i2、差分图、附图和文字；可展开查看结果。', false, 100);
     }
     else { $('state').textContent = '容量不足'; status('没有写入隐写内容。i2 底图仍可下载；缩小选区后重试。', true, 100); }
   } else if (data.action === 'restore') {
     if (!data.detected) { $('state').textContent = '未识别'; status('未发现本项目格式的隐写内容。', false, 100); return; }
-    showMetrics(data.w, data.h, data.length, '已解码并校验全部分块', '已完整还原原图、底图 i2、附加图片和文字。');
+    showMetrics(data.w, data.h, data.length, '已解码并校验全部分块', '已完整还原原图、底图 i2、差分图、附图和文字。');
     $('detection').textContent = `已识别 ImgSteg v${data.version}，全部恢复数据校验通过。`;
     $('restored').hidden = false;
     $('original-output').src = attachDownload('download-original', data.originalBlob, 'ImgSteg-original.png');
@@ -217,6 +283,13 @@ function receive(data) {
     $('decoded-text').value = data.text; $('decode-text-box').hidden = false;
     attachDownload('download-text', new Blob([data.text], { type: 'text/plain;charset=utf-8' }), 'ImgSteg-message.txt');
     $('text-summary').textContent = data.text ? `${format(new TextEncoder().encode(data.text).length)} UTF-8 byte` : '未附加文字';
+    $('decoded-differences-box').hidden = !data.differences.length; $('decoded-difference-count').textContent = `${data.differences.length} 张`;
+    for (const item of data.differences) {
+      const row = document.createElement('li'), preview = document.createElement('img'), link = document.createElement('a'), caption = document.createElement('p');
+      preview.alt = `还原的差分图：${item.name}`; preview.src = outputURL(item.blob); link.href = preview.src; link.download = safeFilename(item.name.replace(/\.[^.]+$/, '') + '.png'); link.className = 'download-link'; link.textContent = `下载 ${item.name} ↓`;
+      caption.className = 'hint'; const parent = data.differences.find(node => node.id === item.parentId); caption.textContent = `父本：${parent ? parent.name : '基底 i2'}`;
+      row.append(preview, link, caption); $('decoded-differences').append(row);
+    }
     $('decoded-attachments-box').hidden = false; $('decoded-attachment-count').textContent = `${data.attachments.length} 张（按存放顺序）`;
     for (const [index, item] of data.attachments.entries()) {
       const row = document.createElement('li'), preview = document.createElement('img'), link = document.createElement('a');
@@ -224,25 +297,128 @@ function receive(data) {
       link.href = preview.src; link.download = safeFilename(item.name); link.className = 'download-link'; link.textContent = `${index + 1}. 下载 ${item.name} ↓`;
       row.append(preview, link); $('decoded-attachments').append(row);
     }
-    $('state').textContent = '还原成功'; status(`已恢复 ${data.regions.length} 个选区、${data.attachments.length} 张附加图片、原图、i2 及文字，校验通过。`, false, 100);
+    $('state').textContent = '还原成功'; status(`已恢复 ${data.differences.length} 张差分图、${data.attachments.length} 张附图、原图、i2 及文字；展开查看。`, false, 100);
   }
 }
 function changed(preview = true) {
   if (preview) revision++;
+  if (displayedKey && displayedKey === configuration(displayedAction)) { if (preview) schedulePreview(); return; }
   resetMetrics(); clearOutputs(); $('state').textContent = '待计算'; $('result-note').textContent = '选区或文字已变更，请重新计算生成。';
+  status('内容已变更，等待计算；未变的压缩分块会自动复用。', false, 0);
   if (preview) schedulePreview();
 }
 function blockSize() { return Math.max(2, Math.min(128, Math.trunc(Number($('block-size').value) || 12))); }
 function schedulePreview() {
   clearTimeout(pendingPreview); if (!image || !worker) return;
-  if (!$('show-fill').checked || mode === 'decode') { $('preview').src = sourceURL; return; }
+  if (mode === 'decode') { $('preview').src = sourceURL; return; }
+  if (creationKind === 'difference') {
+    const node = activeDifference();
+    if (!node) { $('preview').src = sourceURL; return; }
+    pendingPreview = setTimeout(() => worker.postMessage({ id: ++request, action: 'diff-preview', differences: differenceMetadata(), nodeId: node.id, revision }), 150); return;
+  }
+  if (!$('show-fill').checked) { $('preview').src = sourceURL; return; }
   pendingPreview = setTimeout(() => worker.postMessage({ id: ++request, action: 'preview', regions, blockSize: blockSize(), revision }), 150);
 }
 function startTask(action) {
   if (busy || !image) return;
   clearTimeout(pendingPreview); resetMetrics(); clearOutputs();
   setBusy(true); taskId = ++request; $('state').textContent = '处理中'; status('正在启动本地计算…', false, 0);
-  worker.postMessage({ id: taskId, action, regions, text: $('extra-text').value, blockSize: blockSize(), attachmentIds: attachments.map(item => item.id) });
+  taskKey = configuration(action); const cached = resultCache.get(action);
+  if (cached?.key === taskKey && (action === 'build' || action === 'analyze')) { receive({ ...cached.data, id: taskId, cached: true }); return; }
+  worker.postMessage({ id: taskId, action, regions: creationKind === 'difference' ? [] : regions, text: $('extra-text').value, blockSize: blockSize(), attachmentIds: attachments.map(item => item.id), differences: creationKind === 'difference' && action === 'build' ? differenceMetadata() : [] });
+}
+function activeDifference() { return differences.find(node => node.id === activeDifferenceId); }
+function regionsEditable() { return Boolean(image && mode === 'encode' && (creationKind === 'cover' || activeDifference()?.policy === 'manual')); }
+function differenceMetadata() { return differences.map(node => ({ id: node.id, name: node.name, parentId: node.parentId, policy: node.policy, regions: node.regions.map(({ x, y, w, h }) => ({ x, y, w, h })) })); }
+function configuration(action) {
+  const base = { action, kind: creationKind, regions: creationKind === 'cover' ? regions : [], blockSize: blockSize() };
+  if (action === 'build') {
+    base.text = $('extra-text').value; base.attachments = attachments.map(item => item.id);
+    base.differences = creationKind === 'difference' ? differenceMetadata().map(node => ({ ...node, regions: node.policy === 'manual' ? node.regions : [] })) : [];
+  }
+  return JSON.stringify(base);
+}
+function clearDifferences() {
+  for (const node of differences) URL.revokeObjectURL(node.previewURL);
+  differences = []; activeDifferenceId = null; $('difference-list').replaceChildren();
+  $('diff-status').textContent = '选择一张差分图查看与父本的差异。'; $('diff-status').classList.remove('error');
+}
+function updateCreationView() {
+  document.body.dataset.creation = creationKind;
+  $('difference-controls').hidden = creationKind !== 'difference';
+  $('show-fill-label').hidden = creationKind !== 'cover' || mode !== 'encode';
+  const node = activeDifference();
+  $('editor-context').textContent = creationKind === 'cover' ? '编辑遮盖选区；预览填充后的底图 i2。' : node ? `差分预览：${node.name} ← ${node.parentId === 'base' ? '基底 i2' : differences.find(item => item.id === node.parentId)?.name}` : '基底图 i2：作为导出隐写 PNG 的主显示图片，不作遮盖。';
+  setBusy(busy); renderRegions(); schedulePreview();
+}
+function editDifference(id) {
+  if (busy) return;
+  activeDifferenceId = id; selectedIndex = -1; selectedPart = 'move'; drag = null; revision++;
+  regions = activeDifference()?.regions || [];
+  if (activeDifference()) $('preview').src = activeDifference().previewURL; else if (sourceURL) $('preview').src = sourceURL;
+  renderDifferences(); updateCreationView();
+}
+function renderDifferences() {
+  $('difference-list').replaceChildren();
+  differences.forEach((node, index) => {
+    const row = document.createElement('li'); row.classList.toggle('active-difference', node.id === activeDifferenceId);
+    const thumb = document.createElement('img'); thumb.src = node.previewURL; thumb.alt = node.name;
+    const fields = document.createElement('div'), title = document.createElement('strong'); title.textContent = `${index + 1}. ${node.name}`; fields.append(title);
+    const parentLabel = document.createElement('label'); parentLabel.textContent = '父本 ';
+    const parent = document.createElement('select'); parent.setAttribute('aria-label', `差分图 ${index + 1} 父本`);
+    for (const candidate of [{ id: 'base', name: '基底 i2' }, ...differences.filter(item => item.id !== node.id)]) {
+      const option = document.createElement('option'); option.value = candidate.id; option.textContent = candidate.name;
+      try { differenceEngine.graph(differences.map(item => ({ ...item, parentId: item.id === node.id ? candidate.id : item.parentId }))); } catch { option.disabled = true; }
+      parent.append(option);
+    }
+    parent.value = node.parentId; parent.disabled = busy;
+    parent.onchange = () => {
+      const next = parent.value;
+      try { differenceEngine.graph(differences.map(item => ({ ...item, parentId: item.id === node.id ? next : item.parentId }))); }
+      catch (error) { parent.value = node.parentId; status(error.message, true); return; }
+      node.parentId = next; node.missing = undefined; selectedIndex = -1; renderDifferences(); changed(); updateCreationView();
+    };
+    parentLabel.append(parent);
+    const policyLabel = document.createElement('label'); policyLabel.textContent = '编码 ';
+    const policy = document.createElement('select'); policy.setAttribute('aria-label', `差分图 ${index + 1} 编码方式`);
+    for (const [value, text] of [['auto', '自动框选（≤10）'], ['manual', '手动框选'], ['full', '全图 XOR']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; policy.append(option); }
+    policy.value = node.policy; policy.disabled = busy;
+    policy.onchange = () => { node.policy = policy.value; node.regions = []; node.missing = undefined; if (node.id === activeDifferenceId) { regions = node.regions; selectedIndex = -1; } renderDifferences(); changed(); updateCreationView(); };
+    policyLabel.append(policy); fields.append(parentLabel, policyLabel);
+    const buttons = document.createElement('div'), edit = document.createElement('button'), remove = document.createElement('button'); buttons.className = 'difference-actions';
+    edit.textContent = node.id === activeDifferenceId ? '正在编辑' : '预览 / 框选'; edit.className = 'text-button'; edit.setAttribute('aria-label', `编辑差分图 ${index + 1}`); edit.disabled = busy; edit.onclick = () => editDifference(node.id);
+    remove.textContent = '移除'; remove.className = 'text-button'; remove.disabled = busy; remove.setAttribute('aria-label', `移除差分图 ${index + 1}`);
+    remove.onclick = () => {
+      URL.revokeObjectURL(node.previewURL); differences.splice(index, 1);
+      for (const child of differences) if (child.parentId === node.id) { child.parentId = 'base'; child.missing = undefined; }
+      worker?.postMessage({ action: 'forget-difference', differenceId: node.id, id: ++request });
+      if (activeDifferenceId === node.id) activeDifferenceId = null;
+      regions = activeDifference()?.regions || []; selectedIndex = -1; renderDifferences(); changed(); updateCreationView();
+    };
+    buttons.append(edit, remove); row.append(thumb, fields, buttons); $('difference-list').append(row);
+  });
+}
+function addDifferences(files) {
+  if (busy || !image || !files.length) return;
+  if (files.length + differences.length > 16 || (files.length + differences.length) * image.w * image.h > 40000000) { status('最多 16 张差分图，合计最多 4000 万像素。', true); return; }
+  clearTimeout(pendingPreview); resetMetrics(); clearOutputs(); setBusy(true); taskId = ++request;
+  $('state').textContent = '读取差分图'; status('正在检查差分图尺寸…', false, 0); worker.postMessage({ action: 'diff-upload', id: taskId, files });
+}
+function setResultsOpen(open) {
+  $('capacity-details').hidden = !open; $('toggle-results').setAttribute('aria-expanded', String(open)); $('toggle-results').textContent = open ? '收起明细 ▾' : '容量与结果 ▴';
+}
+function applySettings() {
+  let settings = { mode: 'system', hue: 270 };
+  try { const saved = JSON.parse(localStorage.getItem('ImgSteg.settings.v1')); if (saved && ['system', 'light', 'dark'].includes(saved.mode) && Number.isFinite(saved.hue)) settings = { mode: saved.mode, hue: Math.max(0, Math.min(360, saved.hue)) }; } catch { /* localStorage may be unavailable. */ }
+  const system = matchMedia('(prefers-color-scheme: dark)');
+  function paint() {
+    document.documentElement.dataset.theme = settings.mode === 'system' ? (system.matches ? 'dark' : 'light') : settings.mode;
+    document.documentElement.style.setProperty('--hue', settings.hue); $('theme-mode').value = settings.mode; $('theme-hue').value = settings.hue; $('hue-value').textContent = `${settings.hue}°`;
+  }
+  function saveSettings() { paint(); try { localStorage.setItem('ImgSteg.settings.v1', JSON.stringify(settings)); } catch { /* Keep session preferences. */ } }
+  $('theme-mode').onchange = () => { settings.mode = $('theme-mode').value; saveSettings(); };
+  $('theme-hue').oninput = () => { settings.hue = Number($('theme-hue').value); saveSettings(); };
+  system.addEventListener('change', paint); paint();
 }
 function safeFilename(name) { return name.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_') || 'image'; }
 function clearAttachments() {
@@ -334,6 +510,7 @@ function renderOverlay(draft) {
     }
     $('selection-help').textContent = `已选中选区 ${selectedIndex + 1} · ${rectEditor.labels[selectedPart]}。方向键每次调整 1 像素${['n', 's'].includes(selectedPart) ? '，仅上下键生效' : ['w', 'e'].includes(selectedPart) ? '，仅左右键生效' : ''}；Esc 取消选中。`;
   } else $('selection-help').textContent = '双击选框以选中；拖动内部移动，拖动边或角缩放。方向键每次微调 1 像素；Esc 取消选中后可继续画框。';
+  if (creationKind === 'difference' && !regionsEditable()) $('selection-help').textContent = activeDifference() ? '自动框选与全图 XOR 的选框只读；切换到手动框选后可编辑。' : '请先选择一张差分图进行预览或框选。';
 }
 function renderRegions() {
   $('region-list').replaceChildren(); $('region-count').textContent = `${regions.length} 个选区`; $('no-regions').hidden = regions.length !== 0;
@@ -342,15 +519,15 @@ function renderRegions() {
     const label = document.createElement('strong'); label.textContent = `选区 ${index + 1}`; title.append(label);
     const select = document.createElement('select'); select.setAttribute('aria-label', `选区 ${index + 1} 填充方式`);
     for (const [value, text] of [['mosaic', '马赛克'], ['white', '纯白'], ['black', '纯黑']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; select.append(option); }
-    select.value = r.mode; select.disabled = busy; select.onchange = () => { r.mode = select.value; changed(); };
-    const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'text-button'; remove.textContent = '删除'; remove.disabled = busy; remove.setAttribute('aria-label', `删除选区 ${index + 1}`);
+    select.value = r.mode; select.disabled = busy || !regionsEditable(); select.onchange = () => { r.mode = select.value; changed(); };
+    const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'text-button'; remove.textContent = '删除'; remove.disabled = busy || !regionsEditable(); remove.setAttribute('aria-label', `删除选区 ${index + 1}`);
     remove.onclick = () => { regions.splice(index, 1); if (selectedIndex === index) selectedIndex = -1; else if (selectedIndex > index) selectedIndex--; changed(); renderRegions(); };
-    const pick = document.createElement('button'); pick.className = 'text-button'; pick.textContent = index === selectedIndex ? '已选中' : '选中'; pick.setAttribute('aria-label', `选中选区 ${index + 1}`); pick.disabled = busy; pick.onclick = () => selectRegion(index);
+    const pick = document.createElement('button'); pick.className = 'text-button'; pick.textContent = index === selectedIndex ? '已选中' : '选中'; pick.setAttribute('aria-label', `选中选区 ${index + 1}`); pick.disabled = busy || !regionsEditable(); pick.onclick = () => selectRegion(index);
     title.append(select, pick, remove); row.append(title);
     const fields = document.createElement('div'); fields.className = 'region-fields';
     for (const [key, text] of [['x', 'X'], ['y', 'Y'], ['w', '宽'], ['h', '高']]) {
       const field = document.createElement('label'), caption = document.createElement('span'), input = document.createElement('input'); caption.textContent = text;
-      input.type = 'number'; input.step = '1'; input.dataset.coordinate = key; input.min = key === 'x' || key === 'y' ? '0' : '1'; input.max = String(key === 'x' ? image.w - 1 : key === 'y' ? image.h - 1 : key === 'w' ? image.w - r.x : image.h - r.y); input.value = r[key]; input.disabled = busy; input.setAttribute('aria-label', `选区 ${index + 1} ${text}`);
+      input.type = 'number'; input.step = '1'; input.dataset.coordinate = key; input.min = key === 'x' || key === 'y' ? '0' : '1'; input.max = String(key === 'x' ? image.w - 1 : key === 'y' ? image.h - 1 : key === 'w' ? image.w - r.x : image.h - r.y); input.value = r[key]; input.disabled = busy || !regionsEditable(); input.setAttribute('aria-label', `选区 ${index + 1} ${text}`);
       input.oninput = () => {
         const value = Number(input.value);
         if (input.value === '' || !Number.isInteger(value) || value < Number(input.min) || value > Number(input.max)) return;
@@ -371,8 +548,7 @@ function renderRegions() {
 function setMode(next) {
   mode = next;
   for (const current of ['encode', 'decode']) { $(`tab-${current}`).setAttribute('aria-selected', String(current === mode)); $(`${current}-controls`).hidden = current !== mode; }
-  $('selection-overlay').hidden = mode === 'decode'; $('show-fill-label').hidden = mode === 'decode'; schedulePreview();
-  renderOverlay();
+  $('selection-overlay').hidden = mode === 'decode'; updateCreationView();
   if (mode === 'decode' && image?.detected && !busy) startTask('restore');
 }
 function point(event) {
@@ -386,11 +562,11 @@ function hitSelected(p) {
   return rectEditor.hit(regions[selectedIndex], p, 8 * image.w / Math.max(1, bounds.width), 8 * image.h / Math.max(1, bounds.height));
 }
 $('selection-overlay').addEventListener('dblclick', event => {
-  if (!image || busy || mode !== 'encode') return;
+  if (!regionsEditable() || busy) return;
   event.preventDefault(); drag = null; selectRegion(rectEditor.topmost(regions, point(event)));
 });
 $('selection-overlay').addEventListener('pointerdown', event => {
-  if (!image || busy || mode !== 'encode' || (event.pointerType === 'mouse' && event.button !== 0)) return;
+  if (!regionsEditable() || busy || (event.pointerType === 'mouse' && event.button !== 0)) return;
   const p = point(event), part = hitSelected(p);
   if (!part && regions.length >= 64) { status('最多支持 64 个选区。', true); return; }
   event.preventDefault(); $('selection-overlay').focus({ preventScroll: true });
@@ -402,7 +578,7 @@ $('selection-overlay').addEventListener('pointerdown', event => {
   $('selection-overlay').setPointerCapture(event.pointerId);
 });
 $('selection-overlay').addEventListener('pointermove', event => {
-  if (!image || busy) return;
+  if (!regionsEditable() || busy) return;
   const p = point(event);
   if (drag?.pointerId === event.pointerId) {
     if (drag.kind === 'create') renderOverlay(draftRegion(drag.start, p));
@@ -422,7 +598,7 @@ $('selection-overlay').addEventListener('pointerup', event => {
   renderRegions();
 });
 $('selection-overlay').addEventListener('keydown', event => {
-  if (busy || !image || mode !== 'encode' || event.ctrlKey || event.metaKey || event.altKey) return;
+  if (busy || !regionsEditable() || event.ctrlKey || event.metaKey || event.altKey) return;
   if (event.key === 'Escape') { event.preventDefault(); drag = null; selectRegion(-1); return; }
   const directions = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
   if (!directions[event.key] || !regions[selectedIndex] || drag) return;
@@ -430,21 +606,32 @@ $('selection-overlay').addEventListener('keydown', event => {
   applyGeometry(rectEditor.adjust(regions[selectedIndex], selectedPart, dx, dy, image.w, image.h));
 });
 for (const name of ['pointercancel', 'lostpointercapture']) $('selection-overlay').addEventListener(name, () => { if (drag) { drag = null; renderOverlay(); } });
-$('add-region').onclick = () => { if (!image || busy || regions.length >= 64) return; regions.push({ x: Math.floor(image.w / 4), y: Math.floor(image.h / 4), w: Math.max(1, Math.floor(image.w / 4)), h: Math.max(1, Math.floor(image.h / 4)), mode: $('new-fill').value }); selectedIndex = regions.length - 1; selectedPart = 'move'; changed(); renderRegions(); };
-$('clear-regions').onclick = () => { regions = []; selectedIndex = -1; changed(); renderRegions(); };
+$('add-region').onclick = () => { if (!regionsEditable() || busy || regions.length >= 64) return; regions.push({ x: Math.floor(image.w / 4), y: Math.floor(image.h / 4), w: Math.max(1, Math.floor(image.w / 4)), h: Math.max(1, Math.floor(image.h / 4)), mode: $('new-fill').value }); selectedIndex = regions.length - 1; selectedPart = 'move'; changed(); renderRegions(); };
+$('clear-regions').onclick = () => { regions.length = 0; selectedIndex = -1; changed(); renderRegions(); };
 $('block-size').onchange = () => { $('block-size').value = blockSize(); changed(); };
 $('extra-text').oninput = () => { $('text-length').textContent = `${format(new TextEncoder().encode($('extra-text').value).length)} UTF-8 byte`; changed(false); };
 $('show-fill').onchange = schedulePreview;
 $('tab-encode').onclick = () => setMode('encode'); $('tab-decode').onclick = () => setMode('decode');
 $('generate').onclick = () => startTask('build'); $('analyze').onclick = () => startTask('analyze'); $('restore').onclick = () => startTask('restore');
 $('demo').onclick = () => openFile(null, true);
+$('creation-kind').onchange = () => {
+  if (creationKind === 'cover') coverRegions = regions;
+  creationKind = $('creation-kind').value; selectedIndex = -1; drag = null;
+  regions = creationKind === 'cover' ? coverRegions : activeDifference()?.regions || [];
+  renderDifferences(); changed(); updateCreationView();
+};
+$('add-differences').onclick = () => $('difference-files').click();
+$('difference-files').onchange = event => { addDifferences([...event.target.files]); event.target.value = ''; };
+$('edit-base').onclick = () => editDifference(null);
+$('toggle-results').onclick = () => setResultsOpen($('capacity-details').hidden);
 $('add-attachments').onclick = () => $('attachment-files').click();
 $('attachment-files').onchange = event => { addAttachments([...event.target.files]); event.target.value = ''; };
 $('file').onchange = event => { openFile(event.target.files[0]); event.target.value = ''; };
 for (const name of ['dragenter', 'dragover']) document.addEventListener(name, event => { event.preventDefault(); $('dropzone').classList.add('dragover'); });
 document.addEventListener('dragleave', () => $('dropzone').classList.remove('dragover'));
 document.addEventListener('drop', event => { event.preventDefault(); $('dropzone').classList.remove('dragover'); if (!dragAttachmentId) openFile(event.dataTransfer.files[0]); });
-$('cancel').onclick = () => { if (worker) worker.terminate(); worker = null; clearTimeout(pendingPreview); ++request; taskId = loadId = 0; image = null; regions = []; selectedIndex = -1; clearAttachments(); renderRegions(); setBusy(false); $('state').textContent = '已取消'; $('dimensions').textContent = '请重新选择'; status('计算已取消。请重新选择图片以开始新的处理。', false, 0); };
-window.addEventListener('beforeunload', () => { if (worker) worker.terminate(); if (sourceURL) URL.revokeObjectURL(sourceURL); if (previewURL) URL.revokeObjectURL(previewURL); for (const item of attachments) URL.revokeObjectURL(item.previewURL); for (const url of outputURLs) URL.revokeObjectURL(url); });
+$('cancel').onclick = () => { if (worker) worker.terminate(); worker = null; clearTimeout(pendingPreview); ++request; taskId = loadId = 0; image = null; regions = []; coverRegions = regions; selectedIndex = -1; clearDifferences(); resultCache.clear(); clearAttachments(); renderRegions(); setBusy(false); $('state').textContent = '已取消'; $('dimensions').textContent = '请重新选择'; status('计算已取消。请重新选择图片以开始新的处理。', false, 0); };
+window.addEventListener('beforeunload', () => { if (worker) worker.terminate(); if (sourceURL) URL.revokeObjectURL(sourceURL); if (previewURL) URL.revokeObjectURL(previewURL); for (const item of [...attachments, ...differences]) URL.revokeObjectURL(item.previewURL); for (const url of outputURLs) URL.revokeObjectURL(url); });
 window.addEventListener('resize', () => { if (image) renderOverlay(); });
 setBusy(false);
+applySettings(); updateCreationView();
