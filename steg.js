@@ -156,8 +156,8 @@ function ImgSteg() {
     if (rgba.length !== w * h * 4) throw new Error('载体像素长度无效');
     if (w * h * 9 < HEADER * 8) return { detected: false };
     const bytes = readCarrier(rgba, HEADER), v = viewOf(bytes);
-    if (!equal(bytes.subarray(0, 7), new Uint8Array(MAGIC.slice(0, 7))) || ![49, 50, 51].includes(bytes[7])) return { detected: false };
-    const version = bytes[7] - 48, header = version === 3 ? 64 : version === 2 ? 56 : HEADER;
+    if (!equal(bytes.subarray(0, 7), new Uint8Array(MAGIC.slice(0, 7))) || ![49, 50, 51, 52].includes(bytes[7])) return { detected: false };
+    const version = bytes[7] - 48, header = version >= 3 ? 64 : version === 2 ? 56 : HEADER;
     const length = v.getUint32(8), count = v.getUint32(20);
     if (length < header || length * 8 > w * h * 9 || v.getUint32(12) !== w || v.getUint32(16) !== h || count > MAX_REGIONS || v.getUint32(44) > MAX_TEXT + 20) throw new Error('发现 ImgSteg 标记，但文件头损坏或尺寸已改变');
     let attachmentCount = 0, attachmentLength = 0;
@@ -165,7 +165,7 @@ function ImgSteg() {
     if (version >= 2) {
       const extra = viewOf(readCarrier(rgba, header)); attachmentCount = extra.getUint32(48); attachmentLength = extra.getUint32(52);
       if (attachmentCount > MAX_ATTACHMENTS || attachmentLength > length - header || (attachmentCount === 0) !== (attachmentLength === 0)) throw new Error('附加图片计数或长度无效');
-      if (version === 3) { diffCount = extra.getUint32(56); diffLength = extra.getUint32(60); if (!diffCount || diffCount > 16 || diffCount * w * h > MAX_PIXELS || diffLength < 20 || diffLength > length - header) throw new Error('差分图区段长度或数量无效'); }
+      if (version >= 3) { diffCount = extra.getUint32(56); diffLength = extra.getUint32(60); if (!diffCount || diffCount > 16 || diffCount * w * h > MAX_PIXELS || diffLength < 20 || diffLength > length - header) throw new Error('差分图区段长度或数量无效'); }
     }
     return { detected: true, length, count, version, header, attachmentCount, attachmentLength, diffCount, diffLength };
   }
@@ -202,7 +202,7 @@ function ImgSteg() {
     }
     let diffLength = 0;
     if (differences.length) {
-      const block = await diffCodec.encode(differences, regions.length ? base : original, w, h, encodeBytes, stage(regions.length + 2, '压缩差分图'));
+      const block = await diffCodec.encode(differences, original, w, h, encodeBytes, stage(regions.length + 2, '压缩差分图'));
       parts.push(block.bytes); diffLength = block.bytes.length; methods.push(...block.methods);
     }
     let attachmentLength = 0;
@@ -223,7 +223,7 @@ function ImgSteg() {
     const length = header + parts.reduce((sum, p) => sum + p.length, 0), bytes = new Uint8Array(length), v = viewOf(bytes);
     bytes.set(MAGIC); v.setUint32(8, length); v.setUint32(12, w); v.setUint32(16, h); v.setUint32(20, regions.length);
     v.setUint32(24, lsb.bytes.length); v.setUint32(28, alphaLength); v.setUint32(32, low.crc(base)); v.setUint32(36, low.crc(original)); v.setUint32(44, textLength);
-    if (attachments.length || differences.length) { bytes[7] = differences.length ? 51 : 50; v.setUint32(48, attachments.length); v.setUint32(52, attachmentLength); }
+    if (attachments.length || differences.length) { bytes[7] = differences.length ? (regions.length ? 52 : 51) : 50; v.setUint32(48, attachments.length); v.setUint32(52, attachmentLength); }
     if (differences.length) { v.setUint32(56, differences.length); v.setUint32(60, diffLength); }
     let offset = header;
     for (const part of parts) { bytes.set(part, offset); offset += part.length; }
@@ -276,7 +276,7 @@ function ImgSteg() {
     if (info.diffCount) {
       if (!diffCodec) throw new Error('当前环境未加载差分图解码器');
       report({ progress: 75, message: '正在沿父本路径恢复差分图…' });
-      differences = await diffCodec.decode(take(info.diffLength), base, w, h, decodeBytes);
+      differences = await diffCodec.decode(take(info.diffLength), info.version >= 4 ? original : base, w, h, decodeBytes);
       if (differences.length !== info.diffCount) throw new Error('差分图计数不匹配');
     }
     const attachments = [], attachmentStart = offset;

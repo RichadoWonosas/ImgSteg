@@ -16,7 +16,7 @@ The resulting PNG can restore the original image, the base image **i2**, a whole
 - UTF-8 messages, including newlines, Chinese, emoji, a leading BOM, and NUL characters.
 - Independent compression selection for each block, with precise capacity accounting and a raw-storage fallback.
 - Difference-image families with arbitrary acyclic parent relationships, including parents uploaded later. Each image supports automatic boxes (at most 10), manual boxes with exact coverage validation, or full-image XOR.
-- Automatic ImgSteg v1/v2/v3 detection and recovery of the original image, i2, derived images, ordered attachments, and text.
+- Automatic ImgSteg v1/v2/v3/v4 detection and recovery of the original image, i2, derived images, ordered attachments, and text.
 - Export verification: the generated PNG is read back and its recovered contents are compared byte for byte before a successful result is shown.
 - Remaining capacity in bits, bytes, equivalent RGB pixels, and maximum exact-aspect RAW dimensions for 1:1, 4:3, and 16:9.
 - A compact floating capacity/progress dock that shows remaining whole bytes by default, with the exact remaining bit count in expandable details; sticky mode navigation and light/dark/system themes with an adjustable hue (default: 270°).
@@ -39,7 +39,9 @@ The interface is currently in Simplified Chinese. **仅分析 i2 低位** perfor
 
 ### Difference images
 
-After loading a base image, choose **差分图隐写** in the creation-type selector. The base itself is the visible i2 image and is not covered or redrawn. Upload same-size derived images, then choose each image's parent. Every parent chain must end at i2; self-parenting, missing parents, and cycles are rejected. Forward references are supported. Removing a parent reconnects its direct children to the base and invalidates their coverage information.
+Covering and difference images can be used together. Upload one or multiple images and choose a base; the others become same-size difference images in upload order. The base also appears in the parent list: **预览** shows its covered i2, and **编辑遮盖** edits cover regions. Covered i2 is the implicit, unselectable root; the original unmasked base is reconstructed from it and is the selectable parent of difference images. Parent chains must reach that base; cycles and missing parents are rejected, and forward references are supported. Removing a parent reconnects its children to the unmasked base.
+
+File drops are accepted only in the image preview panel. With a base already loaded, dropping images asks whether to append differences or replace the batch and choose a new base. The explicit replacement input always replaces. Replacement or **清空** clears the previous differences, covers, attachments, and cached results. **预览** (and a non-control row click) shows a difference image in original colors without masks or boxes; **编辑** shows the dimmed difference editor. The main generation button has a side menu containing **仅分析 i2 低位**.
 
 Each image can use:
 
@@ -152,16 +154,16 @@ optional UTF-8 message block (B8C1), always last
 | 36 | 4 | CRC-32 of complete original RGBA bytes |
 | 40 | 4 | CRC-32 of all bytes after the actual container header |
 | 44 | 4 | Final text block length; zero means no text |
-| 48 | 4 | v2/v3: attachment count |
-| 52 | 4 | v2/v3: total attachment section length, including records |
-| 56 | 4 | v3 only: difference-image count |
-| 60 | 4 | v3 only: complete DIF1 section length |
+| 48 | 4 | v2/v3/v4: attachment count |
+| 52 | 4 | v2/v3/v4: total attachment section length, including records |
+| 56 | 4 | v3/v4: difference-image count |
+| 60 | 4 | v3/v4: complete DIF1 section length |
 
-With no difference images, no attachments means v1 and attachments enable v2. Difference images enable v3; v3 retains the attachment fields at offsets 48/52 even when there are no attachments. The body CRC starts after the actual 48/56/64-byte header. The current reader supports all three versions; older readers cannot decode newer versions.
+With no difference images, no attachments means v1 and attachments enable v2. Difference images without covers enable v3; combining covers and differences enables v4. v3/v4 retain the attachment fields at offsets 48/52 even when there are no attachments. The body CRC starts after the actual 48/56/64-byte header. The current reader supports all four versions; older readers cannot decode newer versions.
 
 ### DIF1 section
 
-The section begins with 20 bytes: `DIF1`, image count, width, height, and i2 RGBA CRC-32 (all following fields uint32). Each upload-order image has a 16-byte record: UTF-8 name length (uint16), patch count (uint16), parent index (uint32, 0=i2, 1-based upload order otherwise), child RGBA CRC-32 (uint32), reserved zero (uint32); then the filename bytes. Each patch has five uint32 values for X/Y/width/height/B8C1 length, followed by its RGBA XOR B8C1 block. An identical auto-mode image can have zero patches; full-image XOR has one full-frame patch. Graph reachability, cycles, dimensions, lengths, coverage on encoding, and reconstructed image CRCs are validated.
+The section begins with 20 bytes: `DIF1`, image count, width, height, and root RGBA CRC-32 (i2 in v3; the recovered unmasked original in v4) (all following fields uint32). Each upload-order image has a 16-byte record: UTF-8 name length (uint16), patch count (uint16), parent index (uint32, 0=root, 1-based upload order otherwise), child RGBA CRC-32 (uint32), reserved zero (uint32); then the filename bytes. Each patch has five uint32 values for X/Y/width/height/B8C1 length, followed by its RGBA XOR B8C1 block. An identical auto-mode image can have zero patches; full-image XOR has one full-frame patch. Graph reachability, cycles, dimensions, lengths, coverage on encoding, and reconstructed image CRCs are validated.
 
 A region record is 24 bytes: X/Y/width/height as four uint32 values; one fill byte (0=mosaic, 1=white, 2=black); three zero reserved bytes; and a uint32 block length.
 
@@ -192,7 +194,7 @@ GitHub Pages publishes the repository root from `main`. `.nojekyll` enables dire
 
 `.gitignore` excludes `test/`, `tests/`, and directories beginning with `.` at every level, with an explicit exception for `.github/` so GitHub configuration can be versioned. Local test suites, generated fixtures, screenshots, and publishing helpers are intentionally absent from the published repository and site. Dotfiles such as `.gitignore` and `.nojekyll` remain tracked.
 
-The local development copy includes 54 dependency-free tests covering codecs, PNG filters, transparent pixels, export/read-back, overlap restoration, text/attachment/difference ordering, exact capacity, malformed payloads, geometry constraints, forward-reference DAGs, all three XOR policies, coverage, caches, and v1/v2/v3 compatibility. If that local `tests/` directory is present, run with Node.js 22+:
+The local development copy includes the historical 54 dependency-free tests covering codecs, PNG filters, transparent pixels, export/read-back, overlap restoration, text/attachment/difference ordering, exact capacity, malformed payloads, geometry constraints, forward-reference DAGs, all three XOR policies, coverage, caches, and v1/v2/v3 compatibility. If that local `tests/` directory is present, run with Node.js 22+:
 
 ```sh
 node --test tests/*.test.cjs
@@ -200,3 +202,5 @@ node tests/make-fixtures.cjs
 ```
 
 The local `tests/browser.html` harness generates synthetic attachment files in the browser and exercises the real file-input change handler. Tests are development-only; running ImgSteg itself needs only a modern browser.
+
+Combined-format validation additionally covers v4 PNG round trips with covers, forward parent references, attachments and text, cover edits with cache reuse, and legacy v3 covered-root decoding. This update used focused checks and browser acceptance rather than a full regression run.

@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark">
   <title>ImgSteg（图隐）· 可还原的图片与差分图隐写</title>
-  <link rel="stylesheet" href="style.css?v=3.2">
-  <script src="codec.js?v=3" defer></script><script src="diff.js?v=3" defer></script><script src="steg.js?v=3" defer></script><script src="png.js?v=3" defer></script><script src="editor.js?v=3" defer></script><script src="app.js?v=3.2" defer></script>
+  <link rel="stylesheet" href="style.css?v=3.3">
+  <script src="codec.js?v=3" defer></script><script src="diff.js?v=3" defer></script><script src="steg.js?v=4" defer></script><script src="png.js?v=3" defer></script><script src="editor.js?v=3" defer></script><script src="app.js?v=3.3" defer></script>
 </head>
 <body>
   <header class="topbar"><a class="brand" href="./index.html"><span class="brand-icon">▧</span> 图隐 <span class="brand-en">IMGSTEG</span></a><span class="local-badge"><i></i> 本地处理 · 无需上传服务器</span></header>
@@ -14,25 +14,25 @@
     <div class="workspace">
       <section id="image-preview-panel" class="panel source-panel" aria-labelledby="source-title">
         <div class="panel-heading"><h2 id="source-title"><span class="step">01</span> 图片预览</h2><span id="dimensions" class="muted">等待选择</span></div>
-        <input id="file" class="file-input" type="file" accept="image/*" aria-label="选择本地图片">
+        <input id="file" class="file-input" type="file" accept="image/*" multiple aria-label="选择本地图片">
         <label class="dropzone" id="dropzone" for="file"><span class="upload-icon">↥</span><strong>选择基底图，或拖放到这里</strong><span>制作时选择原图，还原时选择隐写 PNG</span><span class="choose-button">选择本地图片 ↗</span></label>
-        <div id="preview-box" class="preview-box" hidden><div class="editor-stage"><img id="preview" alt="图片编辑预览" draggable="false"><svg id="selection-overlay" xmlns="http://www.w3.org/2000/svg" aria-label="图片选区编辑器" aria-describedby="selection-help" tabindex="0" preserveAspectRatio="none"></svg></div><div class="image-caption"><span id="filename"></span><label for="file" class="change-image">更换基底图 ↗</label></div></div>
+        <div id="preview-box" class="preview-box" hidden><div class="editor-stage"><img id="preview" alt="图片编辑预览" draggable="false"><svg id="selection-overlay" xmlns="http://www.w3.org/2000/svg" aria-label="图片选区编辑器" aria-describedby="selection-help" tabindex="0" preserveAspectRatio="none"></svg></div><div class="image-caption"><span id="filename"></span><span><button id="clear-image" class="text-button">清空</button><label for="file" class="change-image">更换基底图 ↗</label></span></div></div>
         <p id="editor-context" class="editor-context">主显示图片将作为底图 i2。</p>
         <div class="editor-options"><label id="show-fill-label"><input id="show-fill" type="checkbox" checked> 预览填充后的 i2</label><span id="source-info">RGB 每通道低 3 位作为载体</span></div>
         <p id="detection" class="detection" role="status">上传后自动识别本项目的隐写标记。</p><div class="demo-action"><button id="demo" class="text-button">使用合成示例图片 ↗</button></div>
       </section>
       <section class="panel controls-panel">
         <div id="encode-controls" role="tabpanel" aria-labelledby="tab-encode">
-          <div class="panel-heading"><h2><span class="step">02</span> 内容与选区</h2><select id="creation-kind" aria-label="制作类型"><option value="cover">遮盖隐写</option><option value="difference">差分图隐写</option></select></div>
-          <section id="difference-controls" class="difference-controls" hidden><div class="attachment-heading"><h3>差分图与父本</h3><div><button id="edit-base" class="text-button">查看基底 i2</button><button id="add-differences" class="text-button" disabled>上传差分图 ＋</button></div></div><input id="difference-files" class="file-input" type="file" accept="image/*" multiple aria-label="选择多张差分图" disabled><p class="hint">先上传基底图，再上传同尺寸差分图。每张可选择任意无循环的父本，包括后上传的图片。最终所有路径必须到达基底。</p><ol id="difference-list" class="difference-list"></ol><p id="diff-status" class="diff-status" role="status">选择一张差分图查看与父本的差异。</p><div class="diff-legend"><span><i class="white-swatch"></i> 差异像素</span><span><i class="red-swatch"></i> 第一个框之后仍未覆盖的差异</span></div><p class="hint">预览压暗 50%。自动框选最多 10 个；手动框选必须覆盖全部差异。也可选择全图 XOR，不必框选。基底 i2 不作遮盖。</p></section>
+          <div class="panel-heading"><h2><span class="step">02</span> 内容与选区</h2></div>
+          <section id="difference-controls" class="difference-controls"><div class="attachment-heading"><h3>差分图与父本</h3><div><button id="edit-base" class="text-button">编辑基底遮盖</button><button id="add-differences" class="text-button">上传图片 ＋</button></div></div><input id="difference-files" class="file-input" type="file" accept="image/*" multiple aria-label="选择多张差分图" disabled><p class="hint">可一次上传多张图片并选择基底，其余作为同尺寸差分图。每张可选择任意无循环的父本，包括后上传的图片。最终所有路径必须到达基底。</p><ol id="difference-list" class="difference-list"></ol><p id="diff-status" class="diff-status" role="status">选择一张差分图查看与父本的差异。</p><div class="diff-legend"><span><i class="white-swatch"></i> 差异像素</span><span><i class="red-swatch"></i> 第一个框之后仍未覆盖的差异</span></div><p class="hint">编辑时压暗 50%；预览保留原色。自动框选最多 10 个；手动框选必须覆盖全部差异。也可选择全图 XOR，不必框选。基底可同时添加遮盖；遮盖后的 i2 是不可选择的父本，差分与未遮盖图片比较。</p></section>
           <div class="selection-tools cover-only"><label>新选区填充 <select id="new-fill"><option value="mosaic">马赛克</option><option value="white">纯白</option><option value="black">纯黑</option></select></label><label>马赛克块 <input id="block-size" type="number" min="2" max="128" value="12"> px</label></div>
           <div class="region-heading"><strong id="region-count">0 个选区</strong><div><button id="add-region" class="text-button">添加选区</button><button id="clear-regions" class="text-button">清空</button></div></div>
           <p id="no-regions" class="hint">在图上拖出矩形，或点击“添加选区”后填写坐标。</p><p id="selection-help" class="hint" aria-live="polite">双击选框以选中，拖动内部移动或拖边角缩放；方向键微调 1 像素，Esc 取消选中。</p><ol id="region-list" class="region-list"></ol>
           <section class="attachment-entry" aria-labelledby="attachment-title"><div class="attachment-heading"><h3 id="attachment-title">附加图片 <span id="attachment-count">0 张</span></h3><button id="add-attachments" class="text-button" disabled>上传附加图片 ＋</button></div><input id="attachment-files" class="file-input" type="file" accept="image/*" multiple aria-label="选择多张附加图片" disabled><p class="hint">可拖动排序。完整原文件位于图片恢复数据之后、文字之前。最多 32 张、共 32 MiB，最终以容量检查为准。</p><ol id="attachment-list" class="attachment-list"></ol></section>
           <div class="text-entry"><label for="extra-text">附加文字 <span id="text-length">0 UTF-8 byte</span></label><textarea id="extra-text" rows="4" maxlength="1000000" placeholder="可选。文字将存放在所有图片恢复数据之后。"></textarea><p class="hint">隐写内容可被持有图片的人恢复；本工具不提供加密。</p></div>
-          <div class="actions"><button id="generate">计算并生成隐写 PNG ↗</button><button id="analyze" class="cancel">仅分析 i2 低位</button></div>
+          <div class="actions"><div class="split-action"><button id="generate">计算并生成隐写 PNG ↗</button><button id="generate-menu-toggle" aria-label="更多计算选项" aria-expanded="false" aria-controls="generate-menu">▾</button><div id="generate-menu" class="action-menu" hidden><button id="analyze">仅分析 i2 低位</button></div></div></div>
         </div>
-        <div id="decode-controls" role="tabpanel" aria-labelledby="tab-decode" hidden><div class="panel-heading"><h2>识别与还原</h2></div><p class="hint">选择隐写 PNG，自动提取原图、i2、整组差分图、附加图片和文字。兼容 ImgSteg v1/v2/v3。</p><div class="actions"><button id="restore" disabled>提取并还原 ↗</button></div><p class="hint">恢复结果与下载入口位于底部“容量与结果”中。</p></div>
+        <div id="decode-controls" role="tabpanel" aria-labelledby="tab-decode" hidden><div class="panel-heading"><h2>识别与还原</h2></div><p class="hint">选择隐写 PNG，自动提取原图、i2、整组差分图、附加图片和文字。兼容 ImgSteg v1/v2/v3/v4。</p><div class="actions"><button id="restore" disabled>提取并还原 ↗</button></div><p class="hint">恢复结果与下载入口位于底部“容量与结果”中。</p></div>
       </section>
     </div>
     <section class="explanation"><div><span class="eyebrow">ONE BASE · MANY VARIANTS</span><h2>只记录发生改变的部分。</h2></div><div><p>差分图逐像素与父本比较；选框内存储 RGBA 的 XOR 差值，分别压缩并保存父本路径。恢复时从 i2 沿无循环的路径重建全部画面。重叠选框也能正确还原，未覆盖的变化不会被悄悄丢弃。</p><p>完整载荷包括 i2 的低位、恢复区域、差分图、附图、文字及所有记录。只有载荷不超过 9wh 位才生成 PNG，并从导出的文件重新验证全部内容。图片数据留在本机。</p><p class="fine-print">请保留无损 PNG 原文件，转 JPEG、缩放或改色可能损坏隐写。差分图最多 16 张，尺寸与基底一致，合计最多 4000 万像素；载体和恢复结果以解码后的 8 位 RGBA 像素为准。附加图片则保留原文件字节。</p></div></section>
@@ -53,5 +53,5 @@
       <section id="decode-text-box" class="output-section" hidden><h3>附加文字 <span id="text-summary"></span></h3><textarea id="decoded-text" readonly rows="5" aria-label="提取的附加文字"></textarea><a id="download-text" class="secondary-link">下载文字 TXT ↓</a></section>
     </div>
   </aside>
-</body>
+<dialog id="image-import-dialog" aria-labelledby="import-title"><h2 id="import-title">导入图片</h2><p id="import-hint"></p><div id="import-choice"><button id="import-add">作为差分图添加</button><button id="import-replace" class="cancel">更换为一批新图片</button></div><div id="import-base-step" hidden><p>选择一张作为基底，其余图片按上传顺序成为差分图。替换后会清除原有差分图、遮盖和附图。</p><div id="import-candidates"></div><button id="import-confirm">使用所选基底并导入</button></div><button id="import-cancel" class="text-button">取消</button></dialog></body>
 </html>

@@ -5,6 +5,7 @@ const rectEditor = RectEditor();
 const differenceEngine = DiffCodec();
 let worker, image, mode = 'encode', regions = [], revision = 0, busy = false, pendingPreview, drag;
 let selectedIndex = -1, selectedPart = 'move', attachments = [], dragAttachmentId = null;
+let rawPreview = false, pendingBatch = [], queuedDifferences = [];
 let creationKind = 'cover', coverRegions = regions, differences = [], activeDifferenceId = null;
 let taskKey = '', displayedKey = '', displayedAction = '';
 const resultCache = new Map();
@@ -156,7 +157,7 @@ function status(message, error = false, value) {
 }
 function setBusy(value) {
   busy = value; $('cancel').hidden = !value;
-  for (const id of ['generate', 'analyze', 'block-size', 'new-fill', 'extra-text', 'add-attachments', 'attachment-files', 'add-differences', 'difference-files', 'creation-kind']) $(id).disabled = value || !image;
+  for (const id of ['generate', 'analyze', 'block-size', 'new-fill', 'extra-text', 'add-attachments', 'attachment-files', 'add-differences', 'difference-files', 'generate-menu-toggle']) $(id).disabled = value || !image;
   for (const id of ['add-region', 'clear-regions']) $(id).disabled = value || !regionsEditable();
   $('restore').disabled = value || !image || !image.detected;
   $('selection-overlay').classList.toggle('locked', value || !regionsEditable());
@@ -165,6 +166,8 @@ function setBusy(value) {
   for (const input of $('difference-list').querySelectorAll('button,select')) input.disabled = value;
   for (const row of $('difference-list').children) row.classList.toggle('clickable-row', !value);
   $('edit-base').disabled = value || !image;
+  $('add-differences').disabled = value; $('difference-files').disabled = value;
+  if (value) closeGenerateMenu();
   for (const button of $('attachment-list').querySelectorAll('button')) button.disabled = value || button.dataset.unavailable === 'true';
   for (const row of $('attachment-list').children) row.draggable = !value;
 }
@@ -198,11 +201,53 @@ function showMetrics(w, h, bytes, method, note) {
   $('result-note').textContent = note;
   $('payload-summary').textContent = `${format(BigInt(bytes))} / ${format(m.original >> 3n)} byte`;
 }
-function openFile(file, demo = false) {
+function closeGenerateMenu() { $('generate-menu').hidden = true; $('generate-menu-toggle').setAttribute('aria-expanded', 'false'); }
+function clearImage() {
+  clearTimeout(pendingPreview); if (worker) worker.terminate(); worker = null;
+  ++request; taskId = loadId = 0; revision++; image = null; queuedDifferences = [];
+  regions = []; coverRegions = regions; selectedIndex = -1; drag = null; rawPreview = false; creationKind = 'cover';
+  clearDifferences(); clearAttachments(); resultCache.clear(); resetMetrics(); clearOutputs();
+  if (sourceURL) URL.revokeObjectURL(sourceURL); if (previewURL) URL.revokeObjectURL(previewURL); sourceURL = previewURL = undefined;
+  $('preview').removeAttribute('src'); $('preview-box').hidden = true; $('dropzone').hidden = false; $('filename').textContent = ''; $('dimensions').textContent = '等待选择'; $('state').textContent = '尚未开始'; $('detection').textContent = '上传后自动识别本项目的隐写标记。'; $('detection').classList.remove('error');
+  setBusy(false); updateCreationView(); status('已清空图片，可重新上传一张或多张图片。', false, 0);
+}
+let importPreviewURLs = [];
+function releaseImport() {
+  for (const url of importPreviewURLs) URL.revokeObjectURL(url); importPreviewURLs = [];
+  pendingBatch = []; $('import-candidates').replaceChildren();
+}
+function chooseBatchBase() {
+  $('import-choice').hidden = true; $('import-base-step').hidden = false;
+  $('import-candidates').replaceChildren();
+  pendingBatch.forEach((file, index) => {
+    const label = document.createElement('label'), radio = document.createElement('input'), thumb = document.createElement('img'), name = document.createElement('span');
+    radio.type = 'radio'; radio.name = 'batch-base'; radio.value = index; radio.checked = index === 0; thumb.src = URL.createObjectURL(file); importPreviewURLs.push(thumb.src); thumb.alt = ''; name.textContent = file.name; label.append(radio, thumb, name); $('import-candidates').append(label);
+  });
+}
+function replaceBatch(files, baseIndex = 0) {
+  if (!files.length) return;
+  if (files.length > 17) { status('一批最多 1 张基底和 16 张差分图。', true); return; }
+  clearImage(); openFile(files[baseIndex], false, files.filter((_, index) => index !== baseIndex));
+}
+function importImages(files, replace = false) {
+  if (busy) return;
+  files = files.filter(file => file.type.startsWith('image/') || /\.(png|jpe?g|gif|webp|avif|bmp|svg|ico|tiff?)$/i.test(file.name));
+  if (!files.length) { status('请选择图片文件。', true); return; }
+  if (mode === 'decode') { queuedDifferences = []; openFile(files[0]); return; }
+  if (replace && files.length === 1 || !image && files.length === 1) { replaceBatch(files); return; }
+  releaseImport(); pendingBatch = files;
+  $('import-title').textContent = image && !replace ? '如何导入这批图片？' : '选择基底图';
+  $('import-hint').textContent = `已选择 ${files.length} 张图片。`;
+  $('import-choice').hidden = replace || !image; $('import-base-step').hidden = true;
+  if (replace || !image) chooseBatchBase();
+  $('image-import-dialog').showModal();
+}
+function openFile(file, demo = false, batch = []) {
   if (!file && !demo) return;
+  queuedDifferences = batch;
   clearTimeout(pendingPreview); if (worker) worker.terminate(); worker = null;
   image = null; regions = []; drag = null; selectedIndex = -1; selectedPart = 'move'; revision++; taskId = 0;
-  coverRegions = regions; clearDifferences(); resultCache.clear();
+  rawPreview = false; creationKind = 'cover'; coverRegions = regions; clearDifferences(); resultCache.clear();
   clearAttachments();
   resetMetrics(); clearOutputs(); renderRegions();
   if (sourceURL) URL.revokeObjectURL(sourceURL); if (previewURL) URL.revokeObjectURL(previewURL); sourceURL = previewURL = undefined;
@@ -215,7 +260,7 @@ function openFile(file, demo = false) {
 }
 function receive(data) {
   if (data.action === 'diff-preview') {
-    if (data.revision !== revision || data.nodeId !== activeDifferenceId || creationKind !== 'difference' || mode !== 'encode') return;
+    if (data.revision !== revision || data.nodeId !== activeDifferenceId || creationKind !== 'difference' || rawPreview || mode !== 'encode') return;
     if (data.error) { status(data.error, true); $('diff-status').textContent = data.error; return; }
     const node = activeDifference(); if (!node) return;
     node.count = data.count; node.missing = data.missing;
@@ -226,7 +271,7 @@ function receive(data) {
   }
   if (data.action === 'preview') {
     if (data.error) { if (data.revision === revision) status(data.error, true); return; }
-    if (data.done && data.revision === revision && image && mode === 'encode' && $('show-fill').checked) { if (previewURL) URL.revokeObjectURL(previewURL); previewURL = URL.createObjectURL(data.blob); $('preview').src = previewURL; }
+    if (data.done && data.revision === revision && image && mode === 'encode' && creationKind === 'cover' && (rawPreview || $('show-fill').checked)) { if (previewURL) URL.revokeObjectURL(previewURL); previewURL = URL.createObjectURL(data.blob); $('preview').src = previewURL; }
     return;
   }
   if (data.id !== (data.action === 'load' ? loadId : taskId)) return;
@@ -243,11 +288,12 @@ function receive(data) {
     $('preview-box').hidden = false; $('dropzone').hidden = true;
     $('selection-overlay').setAttribute('viewBox', `0 0 ${data.w} ${data.h}`);
     $('dimensions').textContent = `${format(data.w)} × ${format(data.h)} px`; $('source-info').textContent = data.source;
-    $('detection').textContent = data.detectionError || (data.detected ? (mode === 'decode' ? '发现 ImgSteg 标记，正在自动提取并校验。' : '发现 ImgSteg 标记，可切换到“识别与还原”提取内容。') : '未发现本项目的 ImgSteg v1/v2/v3 标记。');
+    $('detection').textContent = data.detectionError || (data.detected ? (mode === 'decode' ? '发现 ImgSteg 标记，正在自动提取并校验。' : '发现 ImgSteg 标记，可切换到“识别与还原”提取内容。') : '未发现本项目的 ImgSteg v1/v2/v3/v4 标记。');
     $('detection').classList.toggle('error', Boolean(data.detectionError));
     $('state').textContent = '就绪'; $('result-note').textContent = mode === 'decode' ? (data.detected ? '已识别隐写标记，正在提取恢复数据。' : '此图片未发现本项目的隐写格式。') : '框选区域、填写文字后，点击“计算并生成隐写 PNG”。';
     status('可在图片上拖出多个矩形选区。', false, 0); setBusy(false); renderRegions();
-    updateCreationView();
+    renderDifferences(); updateCreationView();
+    if (queuedDifferences.length) { const files = queuedDifferences; queuedDifferences = []; addDifferences(files); }
     if (mode === 'decode' && data.detected) startTask('restore');
   } else if (data.action === 'diff-upload') {
     for (const { previewBlob, ...item } of data.items) differences.push({ ...item, parentId: 'base', policy: 'auto', regions: [], previewURL: URL.createObjectURL(previewBlob) });
@@ -261,7 +307,7 @@ function receive(data) {
     $('download').disabled = false; $('download').textContent = '下载低位压缩内容 ↓'; $('download').onclick = () => save(url, 'i2.lsb3');
     $('state').textContent = '分析完成'; status(data.cached ? '已复用上次低位分析结果，未重新压缩。' : `已比较 ${data.candidates} 个低位候选方案，往返校验通过。`, false, 100);
   } else if (data.action === 'build') {
-    if (mode === 'encode' && creationKind === 'cover' && $('show-fill').checked) { if (previewURL) URL.revokeObjectURL(previewURL); previewURL = URL.createObjectURL(data.baseBlob); $('preview').src = previewURL; }
+    if (mode === 'encode' && creationKind === 'cover' && (rawPreview || $('show-fill').checked)) { if (previewURL) URL.revokeObjectURL(previewURL); previewURL = URL.createObjectURL(data.baseBlob); $('preview').src = previewURL; }
     const remaining = BigInt(data.w) * BigInt(data.h) * 9n - BigInt(data.bytes.length) * 8n;
     showMetrics(data.w, data.h, data.bytes.length, '各分块独立择优，详情见下方', data.fits ? '全部恢复数据与文字均可装入，已生成并验证隐写 PNG。' : `容量不足，超出 ${format(-remaining)} bit；请缩小选区、减少文字或更换图片。`);
     for (const item of data.methods) { const row = document.createElement('li'); row.textContent = `${item.label}：${item.method} · ${format(item.bytes)} byte`; $('compression-details').append(row); }
@@ -290,7 +336,7 @@ function receive(data) {
     for (const item of data.differences) {
       const row = document.createElement('li'), preview = document.createElement('img'), link = document.createElement('a'), caption = document.createElement('p');
       preview.alt = `还原的差分图：${item.name}`; preview.src = outputURL(item.blob); link.href = preview.src; link.download = safeFilename(item.name.replace(/\.[^.]+$/, '') + '.png'); link.className = 'download-link'; link.textContent = `下载 ${item.name} ↓`;
-      caption.className = 'hint'; const parent = data.differences.find(node => node.id === item.parentId); caption.textContent = `父本：${parent ? parent.name : '基底 i2'}`;
+      caption.className = 'hint'; const parent = data.differences.find(node => node.id === item.parentId); caption.textContent = `父本：${parent ? parent.name : data.version >= 4 ? '未遮盖基底（原图）' : '基底 i2'}`;
       row.append(preview, link, caption); $('decoded-differences').append(row);
     }
     $('decoded-attachments-box').hidden = false; $('decoded-attachment-count').textContent = `${data.attachments.length} 张（按存放顺序）`;
@@ -304,6 +350,7 @@ function receive(data) {
   }
 }
 function changed(preview = true) {
+  renderDifferences();
   if (preview) revision++;
   if (displayedKey && displayedKey === configuration(displayedAction)) { if (preview) schedulePreview(); return; }
   resetMetrics(); clearOutputs(); $('state').textContent = '待计算'; $('result-note').textContent = '选区或文字已变更，请重新计算生成。';
@@ -314,6 +361,11 @@ function blockSize() { return Math.max(2, Math.min(128, Math.trunc(Number($('blo
 function schedulePreview() {
   clearTimeout(pendingPreview); if (!image || !worker) return;
   if (mode === 'decode') { $('preview').src = sourceURL; return; }
+  if (rawPreview) {
+    if (activeDifference()) $('preview').src = activeDifference().previewURL;
+    else pendingPreview = setTimeout(() => worker.postMessage({ id: ++request, action: 'preview', regions: coverRegions, blockSize: blockSize(), revision }), 150);
+    return;
+  }
   if (creationKind === 'difference') {
     const node = activeDifference();
     if (!node) { $('preview').src = sourceURL; return; }
@@ -324,20 +376,21 @@ function schedulePreview() {
 }
 function startTask(action) {
   if (busy || !image) return;
+  revision++;
   clearTimeout(pendingPreview); resetMetrics(); clearOutputs();
   setBusy(true); taskId = ++request; $('state').textContent = '处理中'; status('正在启动本地计算…', false, 0);
   taskKey = configuration(action); const cached = resultCache.get(action);
   if (cached?.key === taskKey && (action === 'build' || action === 'analyze')) { receive({ ...cached.data, id: taskId, cached: true }); return; }
-  worker.postMessage({ id: taskId, action, regions: creationKind === 'difference' ? [] : regions, text: $('extra-text').value, blockSize: blockSize(), attachmentIds: attachments.map(item => item.id), differences: creationKind === 'difference' && action === 'build' ? differenceMetadata() : [] });
+  worker.postMessage({ id: taskId, action, regions: coverRegions, text: $('extra-text').value, blockSize: blockSize(), attachmentIds: attachments.map(item => item.id), differences: action === 'build' ? differenceMetadata() : [] });
 }
 function activeDifference() { return differences.find(node => node.id === activeDifferenceId); }
-function regionsEditable() { return Boolean(image && mode === 'encode' && (creationKind === 'cover' || activeDifference()?.policy === 'manual')); }
+function regionsEditable() { return Boolean(image && mode === 'encode' && !rawPreview && (creationKind === 'cover' || activeDifference()?.policy === 'manual')); }
 function differenceMetadata() { return differences.map(node => ({ id: node.id, name: node.name, parentId: node.parentId, policy: node.policy, regions: node.regions.map(({ x, y, w, h }) => ({ x, y, w, h })) })); }
 function configuration(action) {
-  const base = { action, kind: creationKind, regions: creationKind === 'cover' ? regions : [], blockSize: blockSize() };
+  const base = { action, regions: coverRegions, blockSize: blockSize() };
   if (action === 'build') {
     base.text = $('extra-text').value; base.attachments = attachments.map(item => item.id);
-    base.differences = creationKind === 'difference' ? differenceMetadata().map(node => ({ ...node, regions: node.policy === 'manual' ? node.regions : [] })) : [];
+    base.differences = differenceMetadata().map(node => ({ ...node, regions: node.policy === 'manual' ? node.regions : [] }));
   }
   return JSON.stringify(base);
 }
@@ -348,16 +401,19 @@ function clearDifferences() {
 }
 function updateCreationView() {
   document.body.dataset.creation = creationKind;
-  $('difference-controls').hidden = creationKind !== 'difference';
-  $('show-fill-label').hidden = creationKind !== 'cover' || mode !== 'encode';
+  $('difference-controls').hidden = false;
+  $('show-fill-label').hidden = creationKind !== 'cover' || rawPreview || mode !== 'encode';
   const node = activeDifference();
-  $('editor-context').textContent = creationKind === 'cover' ? '编辑遮盖选区；预览填充后的底图 i2。' : node ? `差分预览：${node.name} ← ${node.parentId === 'base' ? '基底 i2' : differences.find(item => item.id === node.parentId)?.name}` : '基底图 i2：作为导出隐写 PNG 的主显示图片，不作遮盖。';
+  $('editor-context').textContent = rawPreview ? (node ? `原色预览：${node.name}（点击编辑修改选区）` : '遮盖底图 i2 预览（点击编辑遮盖修改选区）') : creationKind === 'cover' ? '编辑遮盖选区；预览填充后的底图 i2。' : node ? `差分预览：${node.name} ← ${node.parentId === 'base' ? '未遮盖基底' : differences.find(item => item.id === node.parentId)?.name}` : '编辑基底遮盖。';
+  if (!node) { $('diff-status').textContent = '基底图：可同时添加遮盖和差分图。'; $('diff-status').classList.remove('error'); }
+  if (rawPreview) { $('diff-status').textContent = node ? '原色预览：不显示差异蒙层与选框。' : '底图 i2 预览：显示遮盖结果。'; $('diff-status').classList.remove('error'); }
   setBusy(busy); renderRegions(); schedulePreview();
 }
-function editDifference(id) {
+function editDifference(id, preview = false) {
   if (busy) return;
+  rawPreview = preview; creationKind = id ? 'difference' : 'cover';
   activeDifferenceId = id; selectedIndex = -1; selectedPart = 'move'; drag = null; revision++;
-  regions = activeDifference()?.regions || [];
+  regions = activeDifference()?.regions || coverRegions;
   if (activeDifference()) $('preview').src = activeDifference().previewURL; else if (sourceURL) $('preview').src = sourceURL;
   renderDifferences(); updateCreationView();
 }
@@ -366,15 +422,21 @@ function isRowControl(target) {
 }
 function renderDifferences() {
   $('difference-list').replaceChildren();
+  if (image) {
+    const row = document.createElement('li'), thumb = document.createElement('img'), fields = document.createElement('div'), title = document.createElement('strong'), note = document.createElement('p'), buttons = document.createElement('div');
+    row.className = 'clickable-row'; row.classList.toggle('active-difference', !activeDifferenceId); thumb.src = sourceURL; thumb.alt = '基底图'; title.textContent = `基底 · ${$('filename').textContent}`; note.className = 'hint'; note.textContent = coverRegions.length ? `父本：遮盖版 i2（不可选择） · ${coverRegions.length} 个遮盖选区` : '基底图 · 可添加遮盖'; fields.append(title, note); buttons.className = 'difference-actions';
+    for (const [label, preview] of [['预览', true], ['编辑遮盖', false]]) { const button = document.createElement('button'); button.textContent = label; button.className = 'text-button'; button.disabled = busy; button.onclick = () => editDifference(null, preview); buttons.append(button); }
+    row.onclick = event => { if (!isRowControl(event.target)) editDifference(null, true); }; row.append(thumb, fields, buttons); $('difference-list').append(row);
+  }
   differences.forEach((node, index) => {
     const row = document.createElement('li'); row.classList.toggle('active-difference', node.id === activeDifferenceId);
     row.classList.toggle('clickable-row', !busy);
-    row.addEventListener('click', event => { if (!busy && !isRowControl(event.target)) editDifference(node.id); });
+    row.addEventListener('click', event => { if (!busy && !isRowControl(event.target)) editDifference(node.id, true); });
     const thumb = document.createElement('img'); thumb.src = node.previewURL; thumb.alt = node.name;
     const fields = document.createElement('div'), title = document.createElement('strong'); title.textContent = `${index + 1}. ${node.name}`; fields.append(title);
     const parentLabel = document.createElement('label'); parentLabel.textContent = '父本 ';
     const parent = document.createElement('select'); parent.setAttribute('aria-label', `差分图 ${index + 1} 父本`);
-    for (const candidate of [{ id: 'base', name: '基底 i2' }, ...differences.filter(item => item.id !== node.id)]) {
+    for (const candidate of [{ id: 'base', name: '基底（未遮盖）' }, ...differences.filter(item => item.id !== node.id)]) {
       const option = document.createElement('option'); option.value = candidate.id; option.textContent = candidate.name;
       try { differenceEngine.graph(differences.map(item => ({ ...item, parentId: item.id === node.id ? candidate.id : item.parentId }))); } catch { option.disabled = true; }
       parent.append(option);
@@ -393,21 +455,23 @@ function renderDifferences() {
     policy.value = node.policy; policy.disabled = busy;
     policy.onchange = () => { node.policy = policy.value; node.regions = []; node.missing = undefined; if (node.id === activeDifferenceId) { regions = node.regions; selectedIndex = -1; } renderDifferences(); changed(); updateCreationView(); };
     policyLabel.append(policy); fields.append(parentLabel, policyLabel);
-    const buttons = document.createElement('div'), edit = document.createElement('button'), remove = document.createElement('button'); buttons.className = 'difference-actions';
-    edit.textContent = node.id === activeDifferenceId ? '正在编辑' : '预览 / 框选'; edit.className = 'text-button'; edit.setAttribute('aria-label', `编辑差分图 ${index + 1}`); edit.disabled = busy; edit.onclick = () => editDifference(node.id);
+    const buttons = document.createElement('div'), view = document.createElement('button'), edit = document.createElement('button'), remove = document.createElement('button'); buttons.className = 'difference-actions';
+    view.textContent = '预览'; view.className = 'text-button'; view.disabled = busy; view.setAttribute('aria-label', `预览差分图 ${index + 1}`); view.onclick = () => editDifference(node.id, true);
+    edit.textContent = node.id === activeDifferenceId && !rawPreview ? '正在编辑' : '编辑'; edit.className = 'text-button'; edit.setAttribute('aria-label', `编辑差分图 ${index + 1}`); edit.disabled = busy; edit.onclick = () => editDifference(node.id);
     remove.textContent = '移除'; remove.className = 'text-button'; remove.disabled = busy; remove.setAttribute('aria-label', `移除差分图 ${index + 1}`);
     remove.onclick = () => {
       URL.revokeObjectURL(node.previewURL); differences.splice(index, 1);
       for (const child of differences) if (child.parentId === node.id) { child.parentId = 'base'; child.missing = undefined; }
       worker?.postMessage({ action: 'forget-difference', differenceId: node.id, id: ++request });
-      if (activeDifferenceId === node.id) activeDifferenceId = null;
-      regions = activeDifference()?.regions || []; selectedIndex = -1; renderDifferences(); changed(); updateCreationView();
+      if (activeDifferenceId === node.id) { activeDifferenceId = null; creationKind = 'cover'; rawPreview = false; }
+      regions = activeDifference()?.regions || coverRegions; selectedIndex = -1; renderDifferences(); changed(); updateCreationView();
     };
-    buttons.append(edit, remove); row.append(thumb, fields, buttons); $('difference-list').append(row);
+    buttons.append(view, edit, remove); row.append(thumb, fields, buttons); $('difference-list').append(row);
   });
 }
 function addDifferences(files) {
-  if (busy || !image || !files.length) return;
+  if (busy || !files.length) return;
+  if (!image) { importImages(files, true); return; }
   if (files.length + differences.length > 16 || (files.length + differences.length) * image.w * image.h > 40000000) { status('最多 16 张差分图，合计最多 4000 万像素。', true); return; }
   clearTimeout(pendingPreview); resetMetrics(); clearOutputs(); setBusy(true); taskId = ++request;
   $('state').textContent = '读取差分图'; status('正在检查差分图尺寸…', false, 0); worker.postMessage({ action: 'diff-upload', id: taskId, files });
@@ -498,6 +562,7 @@ function applyGeometry(rect) {
 }
 function renderOverlay(draft) {
   const overlay = $('selection-overlay'); overlay.replaceChildren();
+  if (rawPreview) return;
   [...regions, ...(draft ? [draft] : [])].forEach((r, index) => {
     const rect = document.createElementNS(svgNS, 'rect');
     for (const [name, value] of Object.entries({ x: r.x, y: r.y, width: r.w, height: r.h })) rect.setAttribute(name, value);
@@ -518,7 +583,8 @@ function renderOverlay(draft) {
     }
     $('selection-help').textContent = `已选中选区 ${selectedIndex + 1} · ${rectEditor.labels[selectedPart]}。方向键每次调整 1 像素${['n', 's'].includes(selectedPart) ? '，仅上下键生效' : ['w', 'e'].includes(selectedPart) ? '，仅左右键生效' : ''}；Esc 取消选中。`;
   } else $('selection-help').textContent = '双击选框以选中；拖动内部移动，拖动边或角缩放。方向键每次微调 1 像素；Esc 取消选中后可继续画框。';
-  if (creationKind === 'difference' && !regionsEditable()) $('selection-help').textContent = activeDifference() ? '自动框选与全图 XOR 的选框只读；切换到手动框选后可编辑。' : '请先选择一张差分图进行预览或框选。';
+  if (rawPreview) $('selection-help').textContent = '原色预览模式；点击编辑可修改选区。';
+  else if (creationKind === 'difference' && !regionsEditable()) $('selection-help').textContent = activeDifference() ? '自动框选与全图 XOR 的选框只读；切换到手动框选后可编辑。' : '请先选择一张差分图进行预览或框选。';
 }
 function renderRegions() {
   $('region-list').replaceChildren(); $('region-count').textContent = `${regions.length} 个选区`; $('no-regions').hidden = regions.length !== 0;
@@ -622,21 +688,15 @@ $('block-size').onchange = () => { $('block-size').value = blockSize(); changed(
 $('extra-text').oninput = () => { $('text-length').textContent = `${format(new TextEncoder().encode($('extra-text').value).length)} UTF-8 byte`; changed(false); };
 $('show-fill').onchange = schedulePreview;
 $('tab-encode').onclick = () => setMode('encode'); $('tab-decode').onclick = () => setMode('decode');
-$('generate').onclick = () => startTask('build'); $('analyze').onclick = () => startTask('analyze'); $('restore').onclick = () => startTask('restore');
+$('generate').onclick = () => { closeGenerateMenu(); startTask('build'); }; $('analyze').onclick = () => { closeGenerateMenu(); startTask('analyze'); }; $('restore').onclick = () => startTask('restore');
 $('demo').onclick = () => openFile(null, true);
-$('creation-kind').onchange = () => {
-  if (creationKind === 'cover') coverRegions = regions;
-  creationKind = $('creation-kind').value; selectedIndex = -1; drag = null;
-  regions = creationKind === 'cover' ? coverRegions : activeDifference()?.regions || [];
-  renderDifferences(); changed(); updateCreationView();
-};
 $('add-differences').onclick = () => $('difference-files').click();
 $('difference-files').onchange = event => { addDifferences([...event.target.files]); event.target.value = ''; };
 $('edit-base').onclick = () => editDifference(null);
 $('toggle-results').onclick = () => setResultsOpen($('capacity-details').hidden);
 $('add-attachments').onclick = () => $('attachment-files').click();
 $('attachment-files').onchange = event => { addAttachments([...event.target.files]); event.target.value = ''; };
-$('file').onchange = event => { openFile(event.target.files[0]); event.target.value = ''; };
+$('file').onchange = event => { importImages([...event.target.files], true); event.target.value = ''; };
 const imagePreviewPanel = $('image-preview-panel');
 let previewDragDepth = 0;
 function isFileDrag(event) { return Array.from(event.dataTransfer?.types || []).includes('Files') || Boolean(event.dataTransfer?.files?.length); }
@@ -650,14 +710,24 @@ for (const name of ['dragenter', 'dragover']) imagePreviewPanel.addEventListener
 imagePreviewPanel.addEventListener('dragleave', () => { if (previewDragDepth > 0 && --previewDragDepth === 0) clearPreviewDrag(); });
 imagePreviewPanel.addEventListener('drop', event => {
   if (!isFileDrag(event) || dragAttachmentId) return;
-  event.preventDefault(); event.stopPropagation(); clearPreviewDrag(); openFile(event.dataTransfer.files[0]);
+  event.preventDefault(); event.stopPropagation(); clearPreviewDrag(); importImages([...event.dataTransfer.files]);
 });
 // Outside the preview, reject file drops without opening/navigating to the file.
 document.addEventListener('dragover', event => { if (isFileDrag(event)) { event.preventDefault(); event.dataTransfer.dropEffect = 'none'; } });
 document.addEventListener('drop', event => { if (isFileDrag(event)) { event.preventDefault(); clearPreviewDrag(); } });
 document.addEventListener('dragend', clearPreviewDrag);
-$('cancel').onclick = () => { if (worker) worker.terminate(); worker = null; clearTimeout(pendingPreview); ++request; taskId = loadId = 0; image = null; regions = []; coverRegions = regions; selectedIndex = -1; clearDifferences(); resultCache.clear(); clearAttachments(); renderRegions(); setBusy(false); $('state').textContent = '已取消'; $('dimensions').textContent = '请重新选择'; status('计算已取消。请重新选择图片以开始新的处理。', false, 0); };
+$('cancel').onclick = () => { clearImage(); $('state').textContent = '已取消'; status('计算已取消。可重新选择图片。', false, 0); };
 window.addEventListener('beforeunload', () => { if (worker) worker.terminate(); if (sourceURL) URL.revokeObjectURL(sourceURL); if (previewURL) URL.revokeObjectURL(previewURL); for (const item of [...attachments, ...differences]) URL.revokeObjectURL(item.previewURL); for (const url of outputURLs) URL.revokeObjectURL(url); });
 window.addEventListener('resize', () => { if (image) renderOverlay(); });
 setBusy(false);
 applySettings(); updateCreationView();
+
+$('clear-image').onclick = clearImage;
+$('generate-menu-toggle').onclick = () => { const open = $('generate-menu').hidden; $('generate-menu').hidden = !open; $('generate-menu-toggle').setAttribute('aria-expanded', String(open)); };
+document.addEventListener('click', event => { if (!event.target.closest('.split-action')) closeGenerateMenu(); });
+document.addEventListener('keydown', event => { if (event.key === 'Escape') closeGenerateMenu(); });
+$('import-add').onclick = () => { const files = pendingBatch; $('image-import-dialog').close(); addDifferences(files); };
+$('import-replace').onclick = chooseBatchBase;
+$('import-confirm').onclick = () => { const files = pendingBatch; const index = Number(document.querySelector('input[name="batch-base"]:checked')?.value || 0); $('image-import-dialog').close(); replaceBatch(files, index); };
+$('import-cancel').onclick = () => $('image-import-dialog').close();
+$('image-import-dialog').addEventListener('close', releaseImport);
