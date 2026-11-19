@@ -13,7 +13,7 @@
   },
   "sha256": {
     "vendor/brotli-wasm-LICENSE.txt": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
-    "vendor/brotli_wasm.original.js": "fa993a8fc8ef67b39cf2023874feb6e57286882062a3159f37cd43c74a443fcf",
+    "vendor/brotli_wasm.original.js": "249940c044bb7ccad32090786c39ed680d3349a32ab0a78f0524321193882a63",
     "vendor/brotli_wasm_bg.wasm": "9ef0a025046bf7d87b7cdb8eac3f73a5c8fea2f1adb848cc9768345573fcd8a9",
     "vendor/fflate-LICENSE.txt": "805f6cb28bb8b6d3a0badd83c93bccd9671fa01a3b4b92b7042b0743325ac243",
     "vendor/fflate.min.js": "c3b34f2e9f5e74d4d7d64e01cac7a0c01954c6c406414d42185c7b53d6875ddf"
