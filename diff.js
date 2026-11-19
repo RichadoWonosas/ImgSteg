@@ -122,10 +122,48 @@ function DiffCodec() {
     }
     return { rgba, missing };
   }
+  async function encodePatch(xor, w, h, encodeBytes) {
+    const dense = await encodeBytes(xor, w, h, 4);
+    let count = 0; const pixels = w * h, maskLength = Math.ceil(pixels / 8);
+    for (let p = 0; p < pixels; p++) if (xor[p * 4] || xor[p * 4 + 1] || xor[p * 4 + 2] || xor[p * 4 + 3]) count++;
+    const length = maskLength + count * 4;
+    if (length >= xor.length) return { ...dense, sparse: false, denseBytes: dense.bytes.length };
+    const packed = new Uint8Array(Math.ceil(length / 4) * 4); let offset = maskLength;
+    for (let p = 0; p < pixels; p++) if (xor[p * 4] || xor[p * 4 + 1] || xor[p * 4 + 2] || xor[p * 4 + 3]) {
+      packed[p >>> 3] |= 1 << (7 - (p & 7)); packed.set(xor.subarray(p * 4, p * 4 + 4), offset); offset += 4;
+    }
+    const compressed = await encodeBytes(packed, packed.length / 4, 1, 4);
+    if (20 + compressed.bytes.length >= dense.bytes.length) return { ...dense, sparse: false, denseBytes: dense.bytes.length };
+    const bytes = new Uint8Array(20 + compressed.bytes.length), v = view(bytes);
+    bytes.set([83, 80, 88, 49]); v.setUint32(4, w); v.setUint32(8, h); v.setUint32(12, count); v.setUint32(16, low.crc(xor)); bytes.set(compressed.bytes, 20);
+    return { bytes, method: `稀疏掩码＋变化 RGBA / ${compressed.method}`, sparse: true, denseBytes: dense.bytes.length };
+  }
+  async function decodePatch(bytes, w, h, decodeBytes, allowSparse = true) {
+    const sparse = bytes.length >= 4 && String.fromCharCode(...bytes.subarray(0, 4)) === 'SPX1';
+    if (!sparse) {
+      if (bytes.length < 20 || view(bytes).getUint32(4) !== w || view(bytes).getUint32(8) !== h || bytes[12] !== 4) throw new Error('XOR 分块尺寸无效');
+      return (await decodeBytes(bytes)).data;
+    }
+    if (!allowSparse || bytes.length < 40) throw new Error('稀疏分块格式无效');
+    const v = view(bytes), pixels = w * h, count = v.getUint32(12), maskLength = Math.ceil(pixels / 8);
+    if (v.getUint32(4) !== w || v.getUint32(8) !== h || count > pixels) throw new Error('稀疏分块尺寸或计数无效');
+    const length = maskLength + count * 4, padded = Math.ceil(length / 4) * 4, payload = bytes.subarray(20);
+    if (view(payload).getUint32(4) !== padded / 4 || view(payload).getUint32(8) !== 1 || payload[12] !== 4) throw new Error('稀疏分块数据长度无效');
+    const { data } = await decodeBytes(payload);
+    if (data.length !== padded || data.subarray(length).some(value => value !== 0) || pixels % 8 && (data[maskLength - 1] & ((1 << (8 - pixels % 8)) - 1))) throw new Error('稀疏分块填充无效');
+    const xor = new Uint8Array(pixels * 4); let offset = maskLength, actual = 0;
+    for (let p = 0; p < pixels; p++) if (data[p >>> 3] & (1 << (7 - (p & 7)))) {
+      if (++actual > count) throw new Error('稀疏掩码计数不匹配');
+      const value = data.subarray(offset, offset + 4); if (!value.some(x => x !== 0)) throw new Error('稀疏分块含无变化像素');
+      xor.set(value, p * 4); offset += 4;
+    }
+    if (actual !== count || low.crc(xor) !== v.getUint32(16)) throw new Error('稀疏分块计数或校验失败');
+    return xor;
+  }
   async function encode(nodes, base, w, h, encodeBytes, report = () => {}) {
     graph(nodes);
     if (nodes.length * w * h > MAX_PIXELS) throw new Error('差分图合计最多 4000 万像素');
-    const byId = new Map(nodes.map(node => [node.id, node])), parts = [], methods = [];
+    const byId = new Map(nodes.map(node => [node.id, node])), parts = [], methods = []; let sparse = false;
     for (const [index, node] of nodes.entries()) {
       const parent = node.parentId === 'base' ? base : byId.get(node.parentId).rgba;
       if (!['auto', 'manual', 'full'].includes(node.policy)) throw new Error('差分图编码方式无效');
@@ -142,22 +180,23 @@ function DiffCodec() {
         if (!block) {
           const xor = new Uint8Array(r.w * r.h * 4);
           for (let y = 0; y < r.h; y++) for (let x = 0; x < r.w; x++) for (let c = 0; c < 4; c++) { const dest = (y * r.w + x) * 4 + c, src = ((r.y + y) * w + r.x + x) * 4 + c; xor[dest] = parent[src] ^ node.rgba[src]; }
-          block = await encodeBytes(xor, r.w, r.h, 4);
+          block = await encodePatch(xor, r.w, r.h, encodeBytes);
           patches.set(key, block); cacheBytes += block.bytes.length;
           while (cacheBytes > 32 * 1024 * 1024 && patches.size > 1) { const first = patches.keys().next().value; cacheBytes -= patches.get(first).bytes.length; patches.delete(first); }
         }
+        sparse ||= block.sparse;
         const record = new Uint8Array(20), rv = view(record);
         [r.x, r.y, r.w, r.h, block.bytes.length].forEach((value, i) => rv.setUint32(i * 4, value)); parts.push(record, block.bytes);
-        methods.push({ label: `差分图 ${index + 1} · XOR ${patchIndex + 1}`, method: block.method, bytes: block.bytes.length });
+        methods.push({ label: `差分图 ${index + 1} · XOR ${patchIndex + 1}`, method: block.method, bytes: block.bytes.length, denseBytes: block.denseBytes, sparse: block.sparse });
       }
     }
     const bytes = new Uint8Array(20 + parts.reduce((sum, part) => sum + part.length, 0)), v = view(bytes);
-    bytes.set([68, 73, 70, 49]); v.setUint32(4, nodes.length); v.setUint32(8, w); v.setUint32(12, h); v.setUint32(16, low.crc(base));
-    let offset = 20; for (const part of parts) { bytes.set(part, offset); offset += part.length; } return { bytes, methods };
+    bytes.set([68, 73, 70, sparse ? 50 : 49]); v.setUint32(4, nodes.length); v.setUint32(8, w); v.setUint32(12, h); v.setUint32(16, low.crc(base));
+    let offset = 20; for (const part of parts) { bytes.set(part, offset); offset += part.length; } return { bytes, methods, sparse };
   }
   async function decode(bytes, base, w, h, decodeBytes) {
-    if (bytes.length < 20 || String.fromCharCode(...bytes.subarray(0, 4)) !== 'DIF1') throw new Error('差分区段文件头无效');
-    const v = view(bytes), count = v.getUint32(4);
+    if (bytes.length < 20 || !['DIF1', 'DIF2'].includes(String.fromCharCode(...bytes.subarray(0, 4)))) throw new Error('差分区段文件头无效');
+    const v = view(bytes), count = v.getUint32(4), allowSparse = bytes[3] === 50;
     if (count > MAX_NODES || count * w * h > MAX_PIXELS || v.getUint32(8) !== w || v.getUint32(12) !== h || v.getUint32(16) !== low.crc(base)) throw new Error('差分图数量、尺寸或基底校验失败');
     let offset = 20;
     const take = length => { if (length < 0 || length > bytes.length - offset) throw new Error('差分区段被截断'); const value = bytes.subarray(offset, offset + length); offset += length; return value; };
@@ -177,15 +216,14 @@ function DiffCodec() {
       const node = nodes[index], parent = node.parentId === 'base' ? base : nodes[Number(node.parentId.slice(5)) - 1].rgba;
       node.rgba = new Uint8Array(parent);
       for (const r of node.records) {
-        if (r.bytes.length < 20 || view(r.bytes).getUint32(4) !== r.w || view(r.bytes).getUint32(8) !== r.h || r.bytes[12] !== 4) throw new Error('XOR 分块尺寸无效');
-        const block = await decodeBytes(r.bytes);
+        const xor = await decodePatch(r.bytes, r.w, r.h, decodeBytes, allowSparse);
         // Always XOR against the parent, so overlapping boxes cannot cancel bits.
-        for (let y = 0; y < r.h; y++) for (let x = 0; x < r.w; x++) for (let c = 0; c < 4; c++) { const dest = ((r.y + y) * w + r.x + x) * 4 + c; node.rgba[dest] = parent[dest] ^ block.data[(y * r.w + x) * 4 + c]; }
+        for (let y = 0; y < r.h; y++) for (let x = 0; x < r.w; x++) for (let c = 0; c < 4; c++) { const dest = ((r.y + y) * w + r.x + x) * 4 + c; node.rgba[dest] = parent[dest] ^ xor[(y * r.w + x) * 4 + c]; }
       }
       if (low.crc(node.rgba) !== node.crc) throw new Error(`差分图「${node.name}」恢复校验失败`);
     }
     return nodes.map(({ id, parentId, name, rgba }) => ({ id, parentId, name, rgba, w, h }));
   }
-  return { graph, reroot, removeContained, autoBoxes, analyze, coverage, preview, boxesValid, encode, decode };
+  return { graph, reroot, removeContained, autoBoxes, analyze, coverage, preview, boxesValid, encodePatch, decodePatch, encode, decode };
 }
 if (typeof module !== 'undefined') module.exports = DiffCodec;

@@ -4,7 +4,7 @@
 
 Reversible image steganography, entirely in your browser. Cover selected areas with mosaic, white, or black, then store the recovery data, additional images, and a text message inside the image's three least significant RGB bits.
 
-The resulting PNG can restore the original image, the base image **i2**, a whole tree of derived difference images, attached files, and text. No backend, framework, CDN, package installation, or build step is required. Image and message processing runs locally in a Web Worker.
+The resulting PNG can restore the original image, the base image **i2**, a whole tree of derived difference images, attached files, and text. No backend, framework, CDN, package installation, or build step is required. Pinned JS/WASM codecs are bundled locally (see [vendor sources and licenses](vendor/README.md)). Image and message processing runs locally in a Web Worker.
 
 ## Features
 
@@ -16,7 +16,7 @@ The resulting PNG can restore the original image, the base image **i2**, a whole
 - UTF-8 messages, including newlines, Chinese, emoji, a leading BOM, and NUL characters.
 - Independent compression selection for each block, with precise capacity accounting and a raw-storage fallback.
 - Difference-image families with arbitrary acyclic parent relationships, including parents uploaded later. Each image supports automatic boxes (at most 10), manual boxes with exact coverage validation, or full-image XOR.
-- Automatic ImgSteg v1/v2/v3/v4 detection and recovery of the original image, i2, derived images, ordered attachments, and text.
+- Automatic ImgSteg v1/v2/v3/v4/v5 detection and recovery of the original image, i2, derived images, ordered attachments, and text.
 - Export verification: the generated PNG is read back and its recovered contents are compared byte for byte before a successful result is shown.
 - Remaining capacity in bits, bytes, equivalent RGB pixels, and maximum exact-aspect RAW dimensions for 1:1, 4:3, and 16:9.
 - A compact floating capacity/progress dock that shows remaining whole bytes by default, with the exact remaining bit count in expandable details; sticky mode navigation and light/dark/system themes with an adjustable hue (default: 270°).
@@ -159,7 +159,7 @@ optional UTF-8 message block (B8C1), always last
 | 56 | 4 | v3/v4: difference-image count |
 | 60 | 4 | v3/v4: complete DIF1 section length |
 
-With no difference images, no attachments means v1 and attachments enable v2. Difference images without covers enable v3; combining covers and differences enables v4. v3/v4 retain the attachment fields at offsets 48/52 even when there are no attachments. The body CRC starts after the actual 48/56/64-byte header. The current reader supports all four versions; older readers cannot decode newer versions.
+With no difference images, no attachments means v1 and attachments enable v2. Dense-only difference images without covers enable v3; combining covers and dense differences enables v4; sparse differences enable v5. v3/v4 retain the attachment fields at offsets 48/52 even when there are no attachments. The body CRC starts after the actual 48/56/64-byte header. The current reader supports all five versions; older readers cannot decode newer versions.
 
 ### DIF1 section
 
@@ -206,3 +206,15 @@ The local `tests/browser.html` harness generates synthetic attachment files in t
 Combined-format validation additionally covers v4 PNG round trips with covers, forward parent references, attachments and text, cover edits with cache reuse, and legacy v3 covered-root decoding. This update used focused checks and browser acceptance rather than a full regression run.
 
 Each thumbnail has **选为基底图** (disabled on the current base). This reuses loaded pixels, keeps every image, transfers cover coordinates/fills to the new base, and reverses the unique parent path while carrying each edge’s boxes and encoding policy. Attachments and text stay in place. Symmetric XOR/mask caches can be reused; capacity results are invalidated for the next calculation. This differs from replacing the uploaded batch, which clears the old images.
+
+## Sparse differences and bundled high-compression codecs
+
+Each difference rectangle compares a dense RGBA XOR block with a sparse block: a 1-bit-per-pixel change mask followed by the complete RGBA XOR values of changed pixels, in scan order. The mask and values are compressed together. Sparse is used only when its complete block, including the extra header, is smaller. Dense/no-change data retains the dense candidate; overlaps still apply against the unchanged parent. Result details show the selected method and bytes saved against dense.
+
+The existing native candidates are joined by **fflate 0.8.2 DEFLATE level 9** and **brotli-wasm 3.0.1 quality 11**. Both participate in LSB3 and full-byte layout searches. A transformed input over 8 MiB skips Brotli quality 11 to bound costly trials; other candidates remain available. WASM initialization failure skips the WASM candidate. The classic-script bundle embeds the WASM bytes and is serialized into the existing Worker; there are no CDN requests or image uploads. See [vendor/README.md](vendor/README.md) for provenance, licenses and deterministic rebuilding.
+
+Algorithm IDs 6 and 7 extend L3B1/B8C1 for the local DEFLATE-9 and Brotli-11 encoders/readers; 0–5 retain their meanings. Their compressed streams are standard raw DEFLATE and Brotli. Native Brotli/raw-DEFLATE decoding can fall back to the bundled codecs when unavailable. Old readers may not support these new algorithm IDs even when the outer container is v1–v4.
+
+A sparse-enabled difference section uses **DIF2** (the DIF1 records remain unchanged), and its outer container is **IMGSTEG5** with the same 64-byte header/root semantics as v4. Dense-only difference sections keep DIF1 and v3/v4. In DIF2, each patch payload is either the original B8C1 dense block or **SPX1**: 4-byte magic; uint32 width, height, changed-pixel count and dense-XOR CRC-32; then one B8C1 block. All integers are big-endian. The B8C1 decoded bytes contain `ceil(w*h/8)` MSB-first mask bytes, `4*count` RGBA XOR bytes, and zero padding to a multiple of four (encoded as width=paddedLength/4, height=1, channels=4). Count, dimensions, mask padding, zero padding, nonzero changed values and CRC are checked. The current reader accepts v1–v5 and DIF1/DIF2; sparse files require the updated reader.
+
+Focused measurements (synthetic data, not a general compression guarantee): in the development browser, a 128×128 structured LSB sample decreased from 235 bytes using native DEFLATE to 77 bytes using Brotli WASM, with the full search taking about 87 ms vs 514 ms. A 256×256 sparse random-change XOR block decreased from 4,674 to 4,113 bytes including block headers (about 12%); dense random and zero data retained their dense representation. Full PNG v5 restore and legacy v1–v4 compatibility were checked. High-quality compression trades encoding time and the bundled download size for potential capacity gains.

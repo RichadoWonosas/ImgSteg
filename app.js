@@ -161,7 +161,7 @@ function workerMain() {
   };
 }
 function makeWorker() {
-  const code = `const LsbCodec = ${LsbCodec.toString()}; const DiffCodec = ${DiffCodec.toString()}; const ImgSteg = ${ImgSteg.toString()}; const PngCodec = ${PngCodec.toString()}; (${workerMain.toString()})();`;
+  const code = `const LocalCodecs = ${typeof LocalCodecs === 'function' ? LocalCodecs.toString() : 'undefined'}; const LsbCodec = ${LsbCodec.toString()}; const DiffCodec = ${DiffCodec.toString()}; const ImgSteg = ${ImgSteg.toString()}; const PngCodec = ${PngCodec.toString()}; (${workerMain.toString()})();`;
   const url = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
   try { worker = new Worker(url); } finally { URL.revokeObjectURL(url); }
   worker.onmessage = event => receive(event.data);
@@ -304,7 +304,7 @@ function receive(data) {
     $('preview-box').hidden = false; $('dropzone').hidden = true;
     $('selection-overlay').setAttribute('viewBox', `0 0 ${data.w} ${data.h}`);
     $('dimensions').textContent = `${format(data.w)} × ${format(data.h)} px`; $('source-info').textContent = data.source;
-    $('detection').textContent = data.detectionError || (data.detected ? (mode === 'decode' ? '发现 ImgSteg 标记，正在自动提取并校验。' : '发现 ImgSteg 标记，可切换到“识别与还原”提取内容。') : '未发现本项目的 ImgSteg v1/v2/v3/v4 标记。');
+    $('detection').textContent = data.detectionError || (data.detected ? (mode === 'decode' ? '发现 ImgSteg 标记，正在自动提取并校验。' : '发现 ImgSteg 标记，可切换到“识别与还原”提取内容。') : '未发现本项目的 ImgSteg v1/v2/v3/v4/v5 标记。');
     $('detection').classList.toggle('error', Boolean(data.detectionError));
     $('state').textContent = '就绪'; $('result-note').textContent = mode === 'decode' ? (data.detected ? '已识别隐写标记，正在提取恢复数据。' : '此图片未发现本项目的隐写格式。') : '框选区域、填写文字后，点击“计算并生成隐写 PNG”。';
     status('可在图片上拖出多个矩形选区。', false, 0); setBusy(false); renderRegions();
@@ -318,7 +318,7 @@ function receive(data) {
     sourceURL = chosen.previewURL; $('filename').textContent = chosen.name;
     const previous = next.find(node => node.id === chosen.id); previous.name = oldName; previous.previewURL = oldURL;
     differences = next; image.detected = data.detected; $('source-info').textContent = data.source;
-    $('detection').textContent = data.detected ? '发现 ImgSteg 标记，可切换到识别与还原。' : '未发现本项目的 ImgSteg v1/v2/v3/v4 标记。'; $('detection').classList.remove('error');
+    $('detection').textContent = data.detected ? '发现 ImgSteg 标记，可切换到识别与还原。' : '未发现本项目的 ImgSteg v1/v2/v3/v4/v5 标记。'; $('detection').classList.remove('error');
     resultCache.clear(); displayedKey = displayedAction = ''; editDifference(null); changed(); $('state').textContent = '已切换基底'; status('已重定向父本路径并迁移遮盖；图片、附图与文字均保留，无需重新上传。', false, 100);
   } else if (data.action === 'diff-manual') {
     const node = differences.find(item => item.id === data.nodeId); if (!node) return;
@@ -340,7 +340,7 @@ function receive(data) {
     if (mode === 'encode' && creationKind === 'cover' && !baseOriginalPreview && (rawPreview || $('show-fill').checked)) { if (previewURL) URL.revokeObjectURL(previewURL); previewURL = URL.createObjectURL(data.baseBlob); $('preview').src = previewURL; }
     const remaining = BigInt(data.w) * BigInt(data.h) * 9n - BigInt(data.bytes.length) * 8n;
     showMetrics(data.w, data.h, data.bytes.length, '各分块独立择优，详情见下方', data.fits ? '全部恢复数据与文字均可装入，已生成并验证隐写 PNG。' : `容量不足，超出 ${format(-remaining)} bit；请缩小选区、减少文字或更换图片。`);
-    for (const item of data.methods) { const row = document.createElement('li'); row.textContent = `${item.label}：${item.method} · ${format(item.bytes)} byte`; $('compression-details').append(row); }
+    for (const item of data.methods) { const row = document.createElement('li'); row.textContent = `${item.label}：${item.method} · ${format(item.bytes)} byte${item.sparse ? `（比整框节省 ${format(item.denseBytes - item.bytes)} byte）` : ''}`; $('compression-details').append(row); }
     const overhead = data.bytes.length - data.methods.reduce((sum, item) => sum + item.bytes, 0);
     const row = document.createElement('li'); row.textContent = `容器头、选区与附加图片记录：${format(overhead)} byte`; $('compression-details').append(row);
     $('generated').hidden = false; attachDownload('download-base', data.baseBlob, 'ImgSteg-i2.png');

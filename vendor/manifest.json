@@ -1,0 +1,21 @@
+{
+  "brotli-wasm": {
+    "version": "3.0.1",
+    "license": "Apache-2.0",
+    "tarball": "https://registry.npmjs.org/brotli-wasm/-/brotli-wasm-3.0.1.tgz",
+    "integrity": "sha512-U3K72/JAi3jITpdhZBqzSUq+DUY697tLxOuFXB+FpAE/Ug+5C3VZrv4uA674EUZHxNAuQ9wETXNqQkxZD6oL4A=="
+  },
+  "fflate": {
+    "version": "0.8.2",
+    "license": "MIT",
+    "tarball": "https://registry.npmjs.org/fflate/-/fflate-0.8.2.tgz",
+    "integrity": "sha512-cPJU47OaAoCbg0pBvzsgpTPhmhqI5eJjh/JIu8tPj5q+T7iLvW/JAYUqmE7KOB4R1ZyEhzBaIQpQpardBF5z8A=="
+  },
+  "sha256": {
+    "vendor/brotli-wasm-LICENSE.txt": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "vendor/brotli_wasm.original.js": "fa993a8fc8ef67b39cf2023874feb6e57286882062a3159f37cd43c74a443fcf",
+    "vendor/brotli_wasm_bg.wasm": "9ef0a025046bf7d87b7cdb8eac3f73a5c8fea2f1adb848cc9768345573fcd8a9",
+    "vendor/fflate-LICENSE.txt": "805f6cb28bb8b6d3a0badd83c93bccd9671fa01a3b4b92b7042b0743325ac243",
+    "vendor/fflate.min.js": "c3b34f2e9f5e74d4d7d64e01cac7a0c01954c6c406414d42185c7b53d6875ddf"
+  }
+}

@@ -2,7 +2,20 @@
 function LsbCodec() {
   'use strict';
   const layouts = ['紧凑打包', 'RGB 低位值', '通道分离', '位平面', '横向差分', '纵向差分'];
-  const formats = ['raw', 'deflate-raw', 'deflate', 'gzip', 'brotli', 'zstd'];
+  const formats = ['raw', 'deflate-raw', 'deflate', 'gzip', 'brotli', 'zstd', 'deflate-js9', 'brotli-wasm11'];
+  const local = typeof LocalCodecs === 'function' ? LocalCodecs() : null;
+  let algorithmPromise;
+  function supportedAlgorithms() {
+    if (!algorithmPromise) algorithmPromise = (async () => {
+      const result = [];
+      for (let a = 1; a < formats.length; a++) {
+        if (a >= 6) { if (local && await local.available(formats[a])) result.push(a); }
+        else try { new CompressionStream(formats[a]); new DecompressionStream(formats[a]); result.push(a); } catch {}
+      }
+      return result;
+    })();
+    return algorithmPromise;
+  }
   const HEADER = 20;
   function extract(rgba) {
     if (rgba.length % 4) throw new Error('RGBA 数据长度无效');
@@ -61,7 +74,17 @@ function LsbCodec() {
   for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; table[n] = c >>> 0; }
   function crc(bytes) { let c = 0xffffffff; for (const b of bytes) c = table[(c ^ b) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
   async function stream(bytes, format, decode = false, limit = Infinity) {
-    const codec = decode ? new DecompressionStream(format) : new CompressionStream(format);
+    if (format === 'deflate-js9' || format === 'brotli-wasm11') {
+      if (!local) throw new Error('此分块需要新版 ImgSteg 内置编解码库');
+      return local.run(bytes, format, decode, limit);
+    }
+    let codec;
+    try { codec = decode ? new DecompressionStream(format) : new CompressionStream(format); }
+    catch (error) {
+      if (local && format === 'brotli') return local.run(bytes, 'brotli-wasm11', decode, limit);
+      if (local && format === 'deflate-raw') return local.run(bytes, 'deflate-js9', decode, limit);
+      throw error;
+    }
     const reader = new Blob([bytes]).stream().pipeThrough(codec).getReader();
     const chunks = []; let length = 0;
     try {
@@ -101,17 +124,15 @@ function LsbCodec() {
     if (!Number.isInteger(w) || !Number.isInteger(h) || w <= 0 || h <= 0 || w * h > 40000000 || symbols.length !== w * h * 3 || symbols.some(v => v > 7)) throw new Error('低位数据或尺寸无效');
     const packed = pack(symbols), checksum = crc(packed);
     let best = container(packed, w, h, 0, 0, checksum), bestLayout = 0, bestAlgo = 0;
-    const supported = [];
-    for (let a = 1; a < formats.length; a++) {
-      try { new CompressionStream(formats[a]); new DecompressionStream(formats[a]); supported.push(a); } catch { /* Browser lacks this format. */ }
-    }
+    const supported = await supportedAlgorithms();
     if (!supported.length) throw new Error('此浏览器不支持原生压缩，请使用新版 Chrome、Edge、Firefox 或 Safari');
-    let done = 0;
+    let done = 0, tried = 0;
     for (let l = 0; l < layouts.length; l++) {
       const data = transform(symbols, w, h, l);
       for (const a of supported) {
+        if (a === 7 && data.length > 8 * 1024 * 1024) { done++; continue; }
         report({ progress: Math.round(15 + done / (layouts.length * supported.length) * 70), message: `正在比较 ${layouts[l]} / ${formats[a]}…` });
-        const payload = await stream(data, formats[a]);
+        const payload = await stream(data, formats[a]); tried++;
         if (payload.length + HEADER < best.length) { best = container(payload, w, h, l, a, checksum); bestLayout = l; bestAlgo = a; }
         done++;
       }
@@ -119,7 +140,7 @@ function LsbCodec() {
     report({ progress: 90, message: '正在解压并逐字节验证低位数据…' });
     const restored = await decode(best);
     if (restored.packed.length !== packed.length || !packed.every((v, i) => v === restored.packed[i])) throw new Error('往返验证失败');
-    return { bytes: best, method: `${layouts[bestLayout]} / ${bestAlgo ? formats[bestAlgo] : '原样存储'}`, candidates: done + 1, algorithms: supported.map(a => formats[a]) };
+    return { bytes: best, method: `${layouts[bestLayout]} / ${bestAlgo ? formats[bestAlgo] : '原样存储'}`, candidates: tried + 1, algorithms: supported.map(a => formats[a]) };
   }
   function metrics(w, h, byteLength) {
     const original = 9n * BigInt(w) * BigInt(h), n = BigInt(byteLength) * 8n, r = original - n, b = r >> 3n;
@@ -140,6 +161,6 @@ function LsbCodec() {
       return { ratio: `${a}:${b}`, width, height, pixels: width * height };
     });
   }
-  return { encode, decode, metrics, rawSizes, extract, pack, unpack, transform, reverse, layouts, formats, crc, stream };
+  return { encode, decode, metrics, rawSizes, extract, pack, unpack, transform, reverse, layouts, formats, crc, stream, supportedAlgorithms };
 }
 if (typeof module !== 'undefined') module.exports = LsbCodec;
