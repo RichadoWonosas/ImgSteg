@@ -8,6 +8,7 @@ function DiffCodec() {
   const identities = new WeakMap(); let sequence = 0, cacheBytes = 0;
   const patches = new Map(), masks = new Map();
   const identity = object => { if (!identities.has(object)) identities.set(object, ++sequence); return identities.get(object); };
+  const pairKey = (a, b) => { const x = identity(a), y = identity(b); return `${Math.min(x, y)}:${Math.max(x, y)}`; };
   function graph(nodes) {
     if (!Array.isArray(nodes) || nodes.length > MAX_NODES) throw new Error('最多支持 16 张差分图');
     const byId = new Map(), state = new Map(), order = [];
@@ -24,6 +25,25 @@ function DiffCodec() {
       state.set(node.id, 2); order.push(index);
     }
     nodes.forEach((_, index) => visit(index)); return order;
+  }
+  // Reorient only the unique root path. An XOR edge and its boxes are symmetric.
+  // Slot IDs stay stable; the caller exchanges the root/selected pixel and name references.
+  function reroot(nodes, rootId) {
+    graph(nodes);
+    if (!nodes.some(node => node.id === rootId)) throw new Error('请选择已有差分图作为基底');
+    const neighbors = new Map([['base', []], ...nodes.map(node => [node.id, []])]);
+    for (const node of nodes) { neighbors.get(node.id).push({ id: node.parentId, edge: node }); neighbors.get(node.parentId).push({ id: node.id, edge: node }); }
+    const mapId = id => id === rootId ? 'base' : id === 'base' ? rootId : id;
+    const edges = new Map(), seen = new Set([rootId]), queue = [rootId];
+    for (let i = 0; i < queue.length; i++) for (const next of neighbors.get(queue[i])) if (!seen.has(next.id)) {
+      seen.add(next.id); queue.push(next.id);
+      edges.set(mapId(next.id), { parentId: mapId(queue[i]), policy: next.edge.policy, regions: (next.edge.regions || []).map(r => ({ ...r })) });
+    }
+    const result = nodes.map(node => ({ ...node, ...edges.get(node.id) }));
+    graph(result); return result;
+  }
+  function removeContained(boxes) {
+    return boxes.filter((box, index) => !boxes.some((outer, other) => other !== index && outer.x <= box.x && outer.y <= box.y && outer.x + outer.w >= box.x + box.w && outer.y + outer.h >= box.y + box.h && (area(outer) > area(box) || other < index)));
   }
   function boxesValid(boxes, w, h) {
     if (!Array.isArray(boxes) || boxes.length > 64) throw new Error('每张差分图最多支持 64 个手动选框');
@@ -69,11 +89,11 @@ function DiffCodec() {
       }
       components[bestA] = merged; components.splice(bestB, 1);
     }
-    return components.sort((a, b) => a.y - b.y || a.x - b.x);
+    return removeContained(components).sort((a, b) => a.y - b.y || a.x - b.x);
   }
   function analyze(parent, child, w, h) {
     if (!Number.isInteger(w) || !Number.isInteger(h) || w < 1 || h < 1 || w * h > MAX_PIXELS || parent.length !== w * h * 4 || child.length !== parent.length) throw new Error('差分图与父本必须具有相同像素尺寸');
-    const key = `${identity(parent)}:${identity(child)}:${w}:${h}`;
+    const key = `${pairKey(parent, child)}:${w}:${h}`;
     if (masks.has(key)) return masks.get(key);
     const mask = new Uint8Array(w * h); let count = 0;
     for (let p = 0; p < mask.length; p++) { const i = p * 4; if (parent[i] !== child[i] || parent[i + 1] !== child[i + 1] || parent[i + 2] !== child[i + 2] || parent[i + 3] !== child[i + 3]) { mask[p] = 1; count++; } }
@@ -117,7 +137,7 @@ function DiffCodec() {
       hv.setUint16(0, name.length); hv.setUint16(2, boxes.length); hv.setUint32(4, node.parentId === 'base' ? 0 : nodes.findIndex(item => item.id === node.parentId) + 1); hv.setUint32(8, low.crc(node.rgba)); header.set(name, 16); parts.push(header);
       for (const [patchIndex, r] of boxes.entries()) {
         report({ progress: 100 * (index + patchIndex / Math.max(1, boxes.length)) / Math.max(1, nodes.length), message: `差分图 ${index + 1} / XOR 区域 ${patchIndex + 1}` });
-        const key = `${identity(parent)}:${identity(node.rgba)}:${r.x},${r.y},${r.w},${r.h}`;
+        const key = `${pairKey(parent, node.rgba)}:${w}:${r.x},${r.y},${r.w},${r.h}`;
         let block = patches.get(key);
         if (!block) {
           const xor = new Uint8Array(r.w * r.h * 4);
@@ -166,6 +186,6 @@ function DiffCodec() {
     }
     return nodes.map(({ id, parentId, name, rgba }) => ({ id, parentId, name, rgba, w, h }));
   }
-  return { graph, autoBoxes, analyze, coverage, preview, boxesValid, encode, decode };
+  return { graph, reroot, removeContained, autoBoxes, analyze, coverage, preview, boxesValid, encode, decode };
 }
 if (typeof module !== 'undefined') module.exports = DiffCodec;

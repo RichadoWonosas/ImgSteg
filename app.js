@@ -5,6 +5,7 @@ const rectEditor = RectEditor();
 const differenceEngine = DiffCodec();
 let worker, image, mode = 'encode', regions = [], revision = 0, busy = false, pendingPreview, drag;
 let selectedIndex = -1, selectedPart = 'move', attachments = [], dragAttachmentId = null;
+let baseOriginalPreview = false;
 let rawPreview = false, pendingBatch = [], queuedDifferences = [];
 let creationKind = 'cover', coverRegions = regions, differences = [], activeDifferenceId = null;
 let taskKey = '', displayedKey = '', displayedAction = '';
@@ -64,6 +65,21 @@ function workerMain() {
       }
       if (!image) throw new Error('请先上传图片');
       const { rgba, w, h } = image;
+      if (action === 'rebase') {
+        const entry = differenceFiles.get(message.nodeId);
+        if (!entry) throw new Error('基底图片数据已失效');
+        const detected = steg.probe(entry.rgba, w, h).detected;
+        differenceFiles.set(message.nodeId, { ...image, name: message.oldName });
+        image = { rgba: entry.rgba, w, h, source: '已载入的差分图原始像素' }; lowKey = ''; lowResult = undefined;
+        self.postMessage({ id, action, done: true, nodeId: message.nodeId, detected, source: image.source }); return;
+      }
+      if (action === 'diff-manual') {
+        const nodes = differenceNodes(message.differences), node = nodes.find(item => item.id === message.nodeId);
+        if (!node) throw new Error('差分图已失效');
+        const parent = node.parentId === 'base' ? rgba : nodes.find(item => item.id === node.parentId).rgba;
+        const analysis = diff.analyze(parent, node.rgba, w, h);
+        self.postMessage({ id, action, done: true, nodeId: node.id, boxes: analysis.boxes }); return;
+      }
       if (action === 'diff-upload') {
         if (differenceFiles.size + message.files.length > 16 || (differenceFiles.size + message.files.length) * w * h > 40000000) throw new Error('最多 16 张差分图，合计最多 4000 万像素');
         const items = [];
@@ -163,7 +179,7 @@ function setBusy(value) {
   $('selection-overlay').classList.toggle('locked', value || !regionsEditable());
   for (const input of $('region-list').querySelectorAll('input,select,button')) input.disabled = value || !regionsEditable();
   for (const row of $('region-list').children) row.classList.toggle('clickable-row', !value && regionsEditable());
-  for (const input of $('difference-list').querySelectorAll('button,select')) input.disabled = value;
+  for (const input of $('difference-list').querySelectorAll('button,select')) input.disabled = value || input.dataset.unavailable === 'true';
   for (const row of $('difference-list').children) row.classList.toggle('clickable-row', !value);
   $('edit-base').disabled = value || !image;
   $('add-differences').disabled = value; $('difference-files').disabled = value;
@@ -205,7 +221,7 @@ function closeGenerateMenu() { $('generate-menu').hidden = true; $('generate-men
 function clearImage() {
   clearTimeout(pendingPreview); if (worker) worker.terminate(); worker = null;
   ++request; taskId = loadId = 0; revision++; image = null; queuedDifferences = [];
-  regions = []; coverRegions = regions; selectedIndex = -1; drag = null; rawPreview = false; creationKind = 'cover';
+  regions = []; coverRegions = regions; selectedIndex = -1; drag = null; baseOriginalPreview = false; rawPreview = false; creationKind = 'cover';
   clearDifferences(); clearAttachments(); resultCache.clear(); resetMetrics(); clearOutputs();
   if (sourceURL) URL.revokeObjectURL(sourceURL); if (previewURL) URL.revokeObjectURL(previewURL); sourceURL = previewURL = undefined;
   $('preview').removeAttribute('src'); $('preview-box').hidden = true; $('dropzone').hidden = false; $('filename').textContent = ''; $('dimensions').textContent = '等待选择'; $('state').textContent = '尚未开始'; $('detection').textContent = '上传后自动识别本项目的隐写标记。'; $('detection').classList.remove('error');
@@ -247,7 +263,7 @@ function openFile(file, demo = false, batch = []) {
   queuedDifferences = batch;
   clearTimeout(pendingPreview); if (worker) worker.terminate(); worker = null;
   image = null; regions = []; drag = null; selectedIndex = -1; selectedPart = 'move'; revision++; taskId = 0;
-  rawPreview = false; creationKind = 'cover'; coverRegions = regions; clearDifferences(); resultCache.clear();
+  baseOriginalPreview = false; rawPreview = false; creationKind = 'cover'; coverRegions = regions; clearDifferences(); resultCache.clear();
   clearAttachments();
   resetMetrics(); clearOutputs(); renderRegions();
   if (sourceURL) URL.revokeObjectURL(sourceURL); if (previewURL) URL.revokeObjectURL(previewURL); sourceURL = previewURL = undefined;
@@ -271,11 +287,11 @@ function receive(data) {
   }
   if (data.action === 'preview') {
     if (data.error) { if (data.revision === revision) status(data.error, true); return; }
-    if (data.done && data.revision === revision && image && mode === 'encode' && creationKind === 'cover' && (rawPreview || $('show-fill').checked)) { if (previewURL) URL.revokeObjectURL(previewURL); previewURL = URL.createObjectURL(data.blob); $('preview').src = previewURL; }
+    if (data.done && data.revision === revision && image && mode === 'encode' && creationKind === 'cover' && !baseOriginalPreview && (rawPreview || $('show-fill').checked)) { if (previewURL) URL.revokeObjectURL(previewURL); previewURL = URL.createObjectURL(data.blob); $('preview').src = previewURL; }
     return;
   }
   if (data.id !== (data.action === 'load' ? loadId : taskId)) return;
-  if (data.error) { setBusy(false); $('state').textContent = '处理失败'; status(data.error, true, 0); return; }
+  if (data.error) { setBusy(false); if (data.action === 'diff-manual') renderDifferences(); $('state').textContent = '处理失败'; status(data.error, true, 0); return; }
   if (!data.done) { status(data.message, false, data.progress); return; }
   setBusy(false);
   if (data.action === 'build' || data.action === 'analyze') {
@@ -295,6 +311,20 @@ function receive(data) {
     renderDifferences(); updateCreationView();
     if (queuedDifferences.length) { const files = queuedDifferences; queuedDifferences = []; addDifferences(files); }
     if (mode === 'decode' && data.detected) startTask('restore');
+  } else if (data.action === 'rebase') {
+    const chosen = differences.find(node => node.id === data.nodeId);
+    const next = differenceEngine.reroot(differences, chosen.id);
+    const oldName = $('filename').textContent, oldURL = sourceURL;
+    sourceURL = chosen.previewURL; $('filename').textContent = chosen.name;
+    const previous = next.find(node => node.id === chosen.id); previous.name = oldName; previous.previewURL = oldURL;
+    differences = next; image.detected = data.detected; $('source-info').textContent = data.source;
+    $('detection').textContent = data.detected ? '发现 ImgSteg 标记，可切换到识别与还原。' : '未发现本项目的 ImgSteg v1/v2/v3/v4 标记。'; $('detection').classList.remove('error');
+    resultCache.clear(); displayedKey = displayedAction = ''; editDifference(null); changed(); $('state').textContent = '已切换基底'; status('已重定向父本路径并迁移遮盖；图片、附图与文字均保留，无需重新上传。', false, 100);
+  } else if (data.action === 'diff-manual') {
+    const node = differences.find(item => item.id === data.nodeId); if (!node) return;
+    node.policy = 'manual'; node.regions = data.boxes.map(r => ({ ...r, mode: 'mosaic' })); node.missing = 0;
+    if (activeDifferenceId === node.id) { regions = node.regions; selectedIndex = -1; }
+    changed(); updateCreationView(); $('state').textContent = '待计算';
   } else if (data.action === 'diff-upload') {
     for (const { previewBlob, ...item } of data.items) differences.push({ ...item, parentId: 'base', policy: 'auto', regions: [], previewURL: URL.createObjectURL(previewBlob) });
     renderDifferences(); editDifference(data.items[0]?.id || null); changed(); status(`已添加 ${data.items.length} 张差分图，可为每张选择父本与编码方式。`, false, 100);
@@ -307,7 +337,7 @@ function receive(data) {
     $('download').disabled = false; $('download').textContent = '下载低位压缩内容 ↓'; $('download').onclick = () => save(url, 'i2.lsb3');
     $('state').textContent = '分析完成'; status(data.cached ? '已复用上次低位分析结果，未重新压缩。' : `已比较 ${data.candidates} 个低位候选方案，往返校验通过。`, false, 100);
   } else if (data.action === 'build') {
-    if (mode === 'encode' && creationKind === 'cover' && (rawPreview || $('show-fill').checked)) { if (previewURL) URL.revokeObjectURL(previewURL); previewURL = URL.createObjectURL(data.baseBlob); $('preview').src = previewURL; }
+    if (mode === 'encode' && creationKind === 'cover' && !baseOriginalPreview && (rawPreview || $('show-fill').checked)) { if (previewURL) URL.revokeObjectURL(previewURL); previewURL = URL.createObjectURL(data.baseBlob); $('preview').src = previewURL; }
     const remaining = BigInt(data.w) * BigInt(data.h) * 9n - BigInt(data.bytes.length) * 8n;
     showMetrics(data.w, data.h, data.bytes.length, '各分块独立择优，详情见下方', data.fits ? '全部恢复数据与文字均可装入，已生成并验证隐写 PNG。' : `容量不足，超出 ${format(-remaining)} bit；请缩小选区、减少文字或更换图片。`);
     for (const item of data.methods) { const row = document.createElement('li'); row.textContent = `${item.label}：${item.method} · ${format(item.bytes)} byte`; $('compression-details').append(row); }
@@ -362,7 +392,7 @@ function schedulePreview() {
   clearTimeout(pendingPreview); if (!image || !worker) return;
   if (mode === 'decode') { $('preview').src = sourceURL; return; }
   if (rawPreview) {
-    if (activeDifference()) $('preview').src = activeDifference().previewURL;
+    if (activeDifference() || baseOriginalPreview) $('preview').src = activeDifference()?.previewURL || sourceURL;
     else pendingPreview = setTimeout(() => worker.postMessage({ id: ++request, action: 'preview', regions: coverRegions, blockSize: blockSize(), revision }), 150);
     return;
   }
@@ -404,14 +434,14 @@ function updateCreationView() {
   $('difference-controls').hidden = false;
   $('show-fill-label').hidden = creationKind !== 'cover' || rawPreview || mode !== 'encode';
   const node = activeDifference();
-  $('editor-context').textContent = rawPreview ? (node ? `原色预览：${node.name}（点击编辑修改选区）` : '遮盖底图 i2 预览（点击编辑遮盖修改选区）') : creationKind === 'cover' ? '编辑遮盖选区；预览填充后的底图 i2。' : node ? `差分预览：${node.name} ← ${node.parentId === 'base' ? '未遮盖基底' : differences.find(item => item.id === node.parentId)?.name}` : '编辑基底遮盖。';
+  $('editor-context').textContent = rawPreview ? (node ? `原色预览：${node.name}（点击编辑修改选区）` : baseOriginalPreview ? '基底原图预览（未遮盖）' : '遮盖底图 i2 预览（点击编辑遮盖修改选区）') : creationKind === 'cover' ? '编辑遮盖选区；预览填充后的底图 i2。' : node ? `差分预览：${node.name} ← ${node.parentId === 'base' ? '未遮盖基底' : differences.find(item => item.id === node.parentId)?.name}` : '编辑基底遮盖。';
   if (!node) { $('diff-status').textContent = '基底图：可同时添加遮盖和差分图。'; $('diff-status').classList.remove('error'); }
-  if (rawPreview) { $('diff-status').textContent = node ? '原色预览：不显示差异蒙层与选框。' : '底图 i2 预览：显示遮盖结果。'; $('diff-status').classList.remove('error'); }
+  if (rawPreview) { $('diff-status').textContent = node ? '原色预览：不显示差异蒙层与选框。' : baseOriginalPreview ? '基底原图预览：不显示遮盖与选框。' : '底图 i2 预览：显示遮盖结果。'; $('diff-status').classList.remove('error'); }
   setBusy(busy); renderRegions(); schedulePreview();
 }
-function editDifference(id, preview = false) {
+function editDifference(id, preview = false, original = false) {
   if (busy) return;
-  rawPreview = preview; creationKind = id ? 'difference' : 'cover';
+  baseOriginalPreview = original; rawPreview = preview; creationKind = id ? 'difference' : 'cover';
   activeDifferenceId = id; selectedIndex = -1; selectedPart = 'move'; drag = null; revision++;
   regions = activeDifference()?.regions || coverRegions;
   if (activeDifference()) $('preview').src = activeDifference().previewURL; else if (sourceURL) $('preview').src = sourceURL;
@@ -420,13 +450,27 @@ function editDifference(id, preview = false) {
 function isRowControl(target) {
   return Boolean(target.closest?.('button, input, select, textarea, option, a, label, summary, [role="button"], [contenteditable]'));
 }
+function thumbnailWithBaseButton(thumb, node) {
+  const column = document.createElement('div'), button = document.createElement('button'); column.className = 'difference-thumb';
+  button.textContent = '选为基底图'; button.className = 'text-button'; button.disabled = busy || !node;
+  button.dataset.unavailable = String(!node); button.setAttribute('aria-label', node ? `选为基底图：${node.name}` : '当前基底图');
+  if (node) button.onclick = () => selectBase(node.id);
+  column.append(thumb, button); return column;
+}
+function selectBase(id) {
+  if (busy || !image) return;
+  try { differenceEngine.reroot(differences, id); } catch (error) { status(error.message, true); return; }
+  clearTimeout(pendingPreview); revision++; setBusy(true); taskId = ++request;
+  $('state').textContent = '切换基底'; status('正在切换基底与父本方向…', false, 0);
+  worker.postMessage({ action: 'rebase', id: taskId, nodeId: id, oldName: $('filename').textContent });
+}
 function renderDifferences() {
   $('difference-list').replaceChildren();
   if (image) {
     const row = document.createElement('li'), thumb = document.createElement('img'), fields = document.createElement('div'), title = document.createElement('strong'), note = document.createElement('p'), buttons = document.createElement('div');
     row.className = 'clickable-row'; row.classList.toggle('active-difference', !activeDifferenceId); thumb.src = sourceURL; thumb.alt = '基底图'; title.textContent = `基底 · ${$('filename').textContent}`; note.className = 'hint'; note.textContent = coverRegions.length ? `父本：遮盖版 i2（不可选择） · ${coverRegions.length} 个遮盖选区` : '基底图 · 可添加遮盖'; fields.append(title, note); buttons.className = 'difference-actions';
-    for (const [label, preview] of [['预览', true], ['编辑遮盖', false]]) { const button = document.createElement('button'); button.textContent = label; button.className = 'text-button'; button.disabled = busy; button.onclick = () => editDifference(null, preview); buttons.append(button); }
-    row.onclick = event => { if (!isRowControl(event.target)) editDifference(null, true); }; row.append(thumb, fields, buttons); $('difference-list').append(row);
+    for (const [label, preview, original] of [['原图预览', true, true], ['遮盖预览', true, false], ['编辑遮盖', false, false]]) { const button = document.createElement('button'); button.textContent = label; button.className = 'text-button'; button.disabled = busy; button.onclick = () => editDifference(null, preview, original); buttons.append(button); }
+    row.onclick = event => { if (!isRowControl(event.target)) editDifference(null, true); }; row.append(thumbnailWithBaseButton(thumb, null), fields, buttons); $('difference-list').append(row);
   }
   differences.forEach((node, index) => {
     const row = document.createElement('li'); row.classList.toggle('active-difference', node.id === activeDifferenceId);
@@ -453,7 +497,13 @@ function renderDifferences() {
     const policy = document.createElement('select'); policy.setAttribute('aria-label', `差分图 ${index + 1} 编码方式`);
     for (const [value, text] of [['auto', '自动框选（≤10）'], ['manual', '手动框选'], ['full', '全图 XOR']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; policy.append(option); }
     policy.value = node.policy; policy.disabled = busy;
-    policy.onchange = () => { node.policy = policy.value; node.regions = []; node.missing = undefined; if (node.id === activeDifferenceId) { regions = node.regions; selectedIndex = -1; } renderDifferences(); changed(); updateCreationView(); };
+    policy.onchange = () => {
+      if (node.policy === 'auto' && policy.value === 'manual') {
+        clearTimeout(pendingPreview); revision++; setBusy(true); taskId = ++request;
+        $('state').textContent = '保留自动选框'; status('正在保留当前父本对应的自动选框…', false, 0);
+        worker.postMessage({ action: 'diff-manual', id: taskId, nodeId: node.id, differences: differenceMetadata() }); return;
+      }
+      node.policy = policy.value; node.regions = []; node.missing = undefined; if (node.id === activeDifferenceId) { regions = node.regions; selectedIndex = -1; } renderDifferences(); changed(); updateCreationView(); };
     policyLabel.append(policy); fields.append(parentLabel, policyLabel);
     const buttons = document.createElement('div'), view = document.createElement('button'), edit = document.createElement('button'), remove = document.createElement('button'); buttons.className = 'difference-actions';
     view.textContent = '预览'; view.className = 'text-button'; view.disabled = busy; view.setAttribute('aria-label', `预览差分图 ${index + 1}`); view.onclick = () => editDifference(node.id, true);
@@ -466,7 +516,7 @@ function renderDifferences() {
       if (activeDifferenceId === node.id) { activeDifferenceId = null; creationKind = 'cover'; rawPreview = false; }
       regions = activeDifference()?.regions || coverRegions; selectedIndex = -1; renderDifferences(); changed(); updateCreationView();
     };
-    buttons.append(view, edit, remove); row.append(thumb, fields, buttons); $('difference-list').append(row);
+    buttons.append(view, edit, remove); row.append(thumbnailWithBaseButton(thumb, node), fields, buttons); $('difference-list').append(row);
   });
 }
 function addDifferences(files) {

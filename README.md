@@ -39,13 +39,13 @@ The interface is currently in Simplified Chinese. **仅分析 i2 低位** perfor
 
 ### Difference images
 
-Covering and difference images can be used together. Upload one or multiple images and choose a base; the others become same-size difference images in upload order. The base also appears in the parent list: **预览** shows its covered i2, and **编辑遮盖** edits cover regions. Covered i2 is the implicit, unselectable root; the original unmasked base is reconstructed from it and is the selectable parent of difference images. Parent chains must reach that base; cycles and missing parents are rejected, and forward references are supported. Removing a parent reconnects its children to the unmasked base.
+Covering and difference images can be used together. Upload one or multiple images and choose a base; the others become same-size difference images in upload order. The base also appears in the parent list: **原图预览** shows its unmasked pixels, **遮盖预览** shows covered i2, and **编辑遮盖** edits cover regions. Covered i2 is the implicit, unselectable root; the original unmasked base is reconstructed from it and is the selectable parent of difference images. Parent chains must reach that base; cycles and missing parents are rejected, and forward references are supported. Removing a parent reconnects its children to the unmasked base.
 
 File drops are accepted only in the image preview panel. With a base already loaded, dropping images asks whether to append differences or replace the batch and choose a new base. The explicit replacement input always replaces. Replacement or **清空** clears the previous differences, covers, attachments, and cached results. **预览** (and a non-control row click) shows a difference image in original colors without masks or boxes; **编辑** shows the dimmed difference editor. The main generation button has a side menu containing **仅分析 i2 低位**.
 
 Each image can use:
 
-- **自动框选**: generate up to 10 rectangles covering every different pixel.
+- **自动框选**: generate up to 10 rectangles covering every different pixel, then remove completely contained rectangles and duplicates. Switching from automatic to manual preserves those boxes, even for an image that has not been opened in the editor.
 - **手动框选**: draw/edit rectangles with the existing editor. The image is dimmed by 50%, and changed RGBA pixels are marked white (`#FFFFFF`). After the first rectangle, still-uncovered changed pixels appear pale red (`#FFDDDD`). Packing is refused until coverage is complete.
 - **全图 XOR**: XOR all RGBA samples against the parent and compress the result as one full-frame block. No manual selection is needed. Sparse differences can compress well even in this simplest mode.
 
@@ -204,3 +204,5 @@ node tests/make-fixtures.cjs
 The local `tests/browser.html` harness generates synthetic attachment files in the browser and exercises the real file-input change handler. Tests are development-only; running ImgSteg itself needs only a modern browser.
 
 Combined-format validation additionally covers v4 PNG round trips with covers, forward parent references, attachments and text, cover edits with cache reuse, and legacy v3 covered-root decoding. This update used focused checks and browser acceptance rather than a full regression run.
+
+Each thumbnail has **选为基底图** (disabled on the current base). This reuses loaded pixels, keeps every image, transfers cover coordinates/fills to the new base, and reverses the unique parent path while carrying each edge’s boxes and encoding policy. Attachments and text stay in place. Symmetric XOR/mask caches can be reused; capacity results are invalidated for the next calculation. This differs from replacing the uploaded batch, which clears the old images.
