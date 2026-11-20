@@ -10,7 +10,7 @@ The resulting PNG can restore the original image, the base image **i2**, a whole
 
 - Multiple rectangular regions with individual mosaic, white, or black fills and editable pixel coordinates.
 - Double-click selection; drag the interior to move, or any of eight edges/corners to resize.
-- Click a difference-image row's thumbnail, title, or blank area to preview it; click a non-control area of an editable region row to select it. Inputs, labels, dropdowns, and action buttons keep their own behavior.
+- Click a difference-image row's thumbnail, title, or blank area to preview it; click a non-control area of an editable region row to select it. Inputs, labels, dropdowns, and action buttons keep their own behavior. During generation or low-bit analysis, row clicks and original-color/edit previews remain available; parent, encoding and payload edits stay locked.
 - One-pixel arrow-key adjustments. A selected edge responds only to its relevant axis; a corner responds to both. Press `Esc` to deselect and draw another rectangle.
 - Multiple attached images, preserving their original file bytes, names, formats, metadata, and animations. Reorder them by dragging or using the move buttons.
 - UTF-8 messages, including newlines, Chinese, emoji, a leading BOM, and NUL characters.
@@ -60,7 +60,7 @@ Selected rectangles compare parent/child XOR and child-minus-parent modulo-256 r
 
 **主题设置** controls light, dark, or system-following appearance and a 0–360° hue, defaulting to 270°. Preferences are local to the browser origin and do not alter image bytes. Only the essential capacity summary and progress remain permanently visible; the full result panel is collapsible.
 
-The page retains the last full-generation and low-bit-analysis results. Repeating an identical request returns the saved blobs and metrics. Keys include carrier lifetime, regions/fills, mosaic size, difference parents/policies/automatic limits/chunk dimensions/manual boxes, attachments/order, and text. Presentation-only changes are excluded. The Worker also reuses unchanged i2 low-bit/Alpha blocks, saved original regions, attached-file blocks, and XOR patches when other content changes. New carriers and cancellation clear the cache. Compression-block caches are bounded by entry count/bytes; no cache is persisted to disk.
+The page retains the last full-generation and low-bit-analysis results. Repeating an identical request returns the saved blobs and metrics. Keys include carrier lifetime, regions/fills, mosaic size, difference parents/policies/automatic limits/chunk dimensions/manual boxes, attachments/order, and text. Presentation-only changes are excluded. Switching difference/base previews during calculation does not restart the task, replace its result key, or unlock content edits. Preview replies are filtered independently so stale selections cannot overwrite the current view or calculation progress. The Worker also reuses unchanged i2 low-bit/Alpha blocks, saved original regions, attached-file blocks, and XOR patches when other content changes. New carriers and cancellation clear the cache. Compression-block caches are bounded by entry count/bytes; no cache is persisted to disk.
 
 ## How it works
 

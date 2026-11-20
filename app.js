@@ -3,7 +3,7 @@ const $ = id => document.getElementById(id), codec = LsbCodec();
 const format = n => n.toLocaleString('zh-CN'), svgNS = 'http://www.w3.org/2000/svg';
 const rectEditor = RectEditor();
 const differenceEngine = DiffCodec();
-let worker, image, mode = 'encode', regions = [], revision = 0, busy = false, pendingPreview, drag;
+let worker, image, mode = 'encode', regions = [], revision = 0, busy = false, busyAction = '', pendingPreview, drag;
 let selectedIndex = -1, selectedPart = 'move', attachments = [], dragAttachmentId = null;
 let baseOriginalPreview = false;
 let rawPreview = false, pendingBatch = [], queuedDifferences = [];
@@ -178,17 +178,19 @@ function status(message, error = false, value) {
   $('status').textContent = message; $('status').classList.toggle('error', error);
   if (value !== undefined) { $('progress').style.width = `${value}%`; document.querySelector('[role="progressbar"]').setAttribute('aria-valuenow', value); }
 }
-function setBusy(value) {
-  busy = value; $('cancel').hidden = !value;
+function previewsAvailable() { return !busy || busyAction === 'build' || busyAction === 'analyze'; }
+function setBusy(value, action = busyAction) {
+  busy = value; busyAction = value ? action : '';
+  const previewAllowed = previewsAvailable(); $('cancel').hidden = !value;
   for (const id of ['generate', 'analyze', 'block-size', 'new-fill', 'extra-text', 'add-attachments', 'attachment-files', 'add-differences', 'difference-files', 'generate-menu-toggle']) $(id).disabled = value || !image;
   for (const id of ['add-region', 'clear-regions']) $(id).disabled = value || !regionsEditable();
   $('restore').disabled = value || !image || !image.detected;
   $('selection-overlay').classList.toggle('locked', value || !regionsEditable());
   for (const input of $('region-list').querySelectorAll('input,select,button')) input.disabled = value || !regionsEditable();
   for (const row of $('region-list').children) row.classList.toggle('clickable-row', !value && regionsEditable());
-  for (const input of $('difference-list').querySelectorAll('button,select')) input.disabled = value || input.dataset.unavailable === 'true';
-  for (const row of $('difference-list').children) row.classList.toggle('clickable-row', !value);
-  $('edit-base').disabled = value || !image;
+  for (const input of $('difference-list').querySelectorAll('button,select')) input.disabled = (value && !(previewAllowed && input.dataset.preview === 'true')) || input.dataset.unavailable === 'true';
+  for (const row of $('difference-list').children) row.classList.toggle('clickable-row', previewAllowed);
+  $('edit-base').disabled = !previewAllowed || !image;
   $('selection-settings').disabled = value || !image;
   $('add-differences').disabled = value; $('difference-files').disabled = value;
   if (value) closeGenerateMenu();
@@ -285,7 +287,7 @@ function openFile(file, demo = false, batch = []) {
 function receive(data) {
   if (data.action === 'diff-preview') {
     if (data.revision !== revision || data.nodeId !== activeDifferenceId || creationKind !== 'difference' || rawPreview || mode !== 'encode') return;
-    if (data.error) { status(data.error, true); $('diff-status').textContent = data.error; return; }
+    if (data.error) { if (!busy) status(data.error, true); $('diff-status').textContent = data.error; return; }
     const node = activeDifference(); if (!node) return;
     node.count = data.count; node.missing = data.missing; node.chunk = data.chunk; node.resultBoxCount = data.boxCount;
     if (node.policy !== 'manual') { node.regions = data.boxes.map(r => ({ ...r, mode: 'mosaic' })); regions = node.regions; selectedIndex = -1; }
@@ -295,7 +297,7 @@ function receive(data) {
     $('diff-status').classList.toggle('error', data.missing > 0); renderRegions(); setBusy(busy); return;
   }
   if (data.action === 'preview') {
-    if (data.error) { if (data.revision === revision) status(data.error, true); return; }
+    if (data.error) { if (data.revision === revision && !busy) status(data.error, true); return; }
     if (data.done && data.revision === revision && image && mode === 'encode' && creationKind === 'cover' && !baseOriginalPreview && (rawPreview || $('show-fill').checked)) { if (previewURL) URL.revokeObjectURL(previewURL); previewURL = URL.createObjectURL(data.blob); $('preview').src = previewURL; }
     return;
   }
@@ -420,7 +422,7 @@ function startTask(action) {
   if (busy || !image) return;
   revision++;
   clearTimeout(pendingPreview); resetMetrics(); clearOutputs();
-  setBusy(true); taskId = ++request; $('state').textContent = '处理中'; status('正在启动本地计算…', false, 0);
+  setBusy(true, action); taskId = ++request; $('state').textContent = '处理中'; status('正在启动本地计算…', false, 0);
   taskKey = configuration(action); const cached = resultCache.get(action);
   if (cached?.key === taskKey && (action === 'build' || action === 'analyze')) { receive({ ...cached.data, id: taskId, cached: true }); return; }
   worker.postMessage({ id: taskId, action, regions: coverRegions, text: $('extra-text').value, blockSize: blockSize(), attachmentIds: attachments.map(item => item.id), differences: action === 'build' ? differenceMetadata() : [] });
@@ -452,7 +454,7 @@ function updateCreationView() {
   setBusy(busy); renderRegions(); schedulePreview();
 }
 function editDifference(id, preview = false, original = false) {
-  if (busy) return;
+  if (!previewsAvailable()) return;
   baseOriginalPreview = original; rawPreview = preview; creationKind = id ? 'difference' : 'cover';
   activeDifferenceId = id; selectedIndex = -1; selectedPart = 'move'; drag = null; revision++;
   regions = activeDifference()?.regions || coverRegions;
@@ -481,13 +483,13 @@ function renderDifferences() {
   if (image) {
     const row = document.createElement('li'), thumb = document.createElement('img'), fields = document.createElement('div'), title = document.createElement('strong'), note = document.createElement('p'), buttons = document.createElement('div');
     row.className = 'clickable-row'; row.classList.toggle('active-difference', !activeDifferenceId); thumb.src = sourceURL; thumb.alt = '基底图'; title.textContent = `基底 · ${$('filename').textContent}`; note.className = 'hint'; note.textContent = coverRegions.length ? `父本：遮盖版 i2（不可选择） · ${coverRegions.length} 个遮盖选区` : '基底图 · 可添加遮盖'; fields.append(title, note); buttons.className = 'difference-actions';
-    for (const [label, preview, original] of [['原图预览', true, true], ['遮盖预览', true, false], ['编辑遮盖', false, false]]) { const button = document.createElement('button'); button.textContent = label; button.className = 'text-button'; button.disabled = busy; button.onclick = () => editDifference(null, preview, original); buttons.append(button); }
+    for (const [label, preview, original] of [['原图预览', true, true], ['遮盖预览', true, false], ['编辑遮盖', false, false]]) { const button = document.createElement('button'); button.textContent = label; button.className = 'text-button'; button.dataset.preview = 'true'; button.disabled = !previewsAvailable(); button.onclick = () => editDifference(null, preview, original); buttons.append(button); }
     row.onclick = event => { if (!isRowControl(event.target)) editDifference(null, true); }; row.append(thumbnailWithBaseButton(thumb, null), fields, buttons); $('difference-list').append(row);
   }
   differences.forEach((node, index) => {
     const row = document.createElement('li'); row.classList.toggle('active-difference', node.id === activeDifferenceId);
-    row.classList.toggle('clickable-row', !busy);
-    row.addEventListener('click', event => { if (!busy && !isRowControl(event.target)) editDifference(node.id, true); });
+    row.classList.toggle('clickable-row', previewsAvailable());
+    row.addEventListener('click', event => { if (previewsAvailable() && !isRowControl(event.target)) editDifference(node.id, true); });
     const thumb = document.createElement('img'); thumb.src = node.previewURL; thumb.alt = node.name;
     const fields = document.createElement('div'), title = document.createElement('strong'); title.textContent = `${index + 1}. ${node.name}`; fields.append(title);
     const parentLabel = document.createElement('label'); parentLabel.textContent = '父本 ';
@@ -518,8 +520,8 @@ function renderDifferences() {
       node.policy = policy.value; node.regions = []; node.missing = undefined; if (node.id === activeDifferenceId) { regions = node.regions; selectedIndex = -1; } renderDifferences(); changed(); updateCreationView(); };
     policyLabel.append(policy); fields.append(parentLabel, policyLabel);
     const buttons = document.createElement('div'), view = document.createElement('button'), edit = document.createElement('button'), remove = document.createElement('button'); buttons.className = 'difference-actions';
-    view.textContent = '预览'; view.className = 'text-button'; view.disabled = busy; view.setAttribute('aria-label', `预览差分图 ${index + 1}`); view.onclick = () => editDifference(node.id, true);
-    edit.textContent = node.policy === 'chunk' ? '分块预览' : node.id === activeDifferenceId && !rawPreview ? '正在编辑' : '编辑'; edit.className = 'text-button'; edit.setAttribute('aria-label', node.policy === 'chunk' ? `查看分块差分图 ${index + 1}` : `编辑差分图 ${index + 1}`); edit.disabled = busy; edit.onclick = () => editDifference(node.id);
+    view.textContent = '预览'; view.className = 'text-button'; view.dataset.preview = 'true'; view.disabled = !previewsAvailable(); view.setAttribute('aria-label', `预览差分图 ${index + 1}`); view.onclick = () => editDifference(node.id, true);
+    edit.textContent = node.policy === 'chunk' ? '分块预览' : node.id === activeDifferenceId && !rawPreview ? '正在编辑' : '编辑'; edit.className = 'text-button'; edit.setAttribute('aria-label', node.policy === 'chunk' ? `查看分块差分图 ${index + 1}` : `编辑差分图 ${index + 1}`); edit.dataset.preview = 'true'; edit.disabled = !previewsAvailable(); edit.onclick = () => editDifference(node.id);
     remove.textContent = '移除'; remove.className = 'text-button'; remove.disabled = busy; remove.setAttribute('aria-label', `移除差分图 ${index + 1}`);
     remove.onclick = () => {
       URL.revokeObjectURL(node.previewURL); differences.splice(index, 1);
