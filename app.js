@@ -8,6 +8,7 @@ let selectedIndex = -1, selectedPart = 'move', attachments = [], dragAttachmentI
 let baseOriginalPreview = false;
 let rawPreview = false, pendingBatch = [], queuedDifferences = [];
 let creationKind = 'cover', coverRegions = regions, differences = [], activeDifferenceId = null;
+let selectionSettingsKey = '';
 let taskKey = '', displayedKey = '', displayedAction = '';
 const resultCache = new Map();
 let request = 0, taskId = 0, loadId = 0, sourceURL, previewURL;
@@ -44,7 +45,8 @@ function workerMain() {
   }
   self.onmessage = async ({ data: message }) => {
     const { action, id } = message;
-    const progress = update => self.postMessage({ id, action, ...update });
+    let lastProgress = -Infinity;
+    const progress = update => { const now = performance.now(); if (now - lastProgress < 50 && update.progress !== 100) return; lastProgress = now; self.postMessage({ id, action, ...update }); };
     try {
       if (action === 'load') {
         progress({ progress: 2, message: '正在读取本地图片…' });
@@ -78,7 +80,9 @@ function workerMain() {
         if (!node) throw new Error('差分图已失效');
         const parent = node.parentId === 'base' ? rgba : nodes.find(item => item.id === node.parentId).rgba;
         const analysis = diff.analyze(parent, node.rgba, w, h);
-        self.postMessage({ id, action, done: true, nodeId: node.id, boxes: analysis.boxes }); return;
+        const boxes = diff.boxesFor({ ...node, policy: 'auto' }, analysis, w, h);
+        if (boxes.length > 64) throw new Error('当前自动结果超过手动的 64 框上限，请先调低自动上限后再切换。');
+        self.postMessage({ id, action, done: true, nodeId: node.id, boxes }); return;
       }
       if (action === 'diff-upload') {
         if (differenceFiles.size + message.files.length > 16 || (differenceFiles.size + message.files.length) * w * h > 40000000) throw new Error('最多 16 张差分图，合计最多 4000 万像素');
@@ -98,8 +102,10 @@ function workerMain() {
         if (!node) throw new Error('请选择差分图');
         const parent = node.parentId === 'base' ? rgba : nodes.find(item => item.id === node.parentId).rgba;
         const analysis = diff.analyze(parent, node.rgba, w, h), boxes = diff.boxesFor(node, analysis, w, h);
-        const result = diff.preview(node.rgba, analysis, w, h, boxes), plan = node.policy === 'chunk' ? diff.chunkPlan(analysis, w, h) : null;
-        self.postMessage({ id, action, done: true, revision: message.revision, nodeId: node.id, boxes, chunk: plan ? { grid: plan.grid, stats: plan.stats } : null, count: analysis.count, missing: result.missing, blob: await png.encode(result.rgba, w, h) });
+        const result = diff.preview(node.rgba, analysis, w, h, boxes), plan = node.policy === 'chunk' ? diff.chunkPlan(analysis, w, h, node.chunkRows ?? 32, node.chunkCols ?? 32) : null;
+        const rasterized = Boolean(plan && (boxes.length > 1024 || plan.grid.xs.length + plan.grid.ys.length > 256));
+        if (rasterized) diff.rasterChunkPreview(result.rgba, w, h, plan);
+        self.postMessage({ id, action, done: true, revision: message.revision, nodeId: node.id, boxes: rasterized ? [] : boxes, boxCount: boxes.length, chunk: plan ? { grid: rasterized ? null : plan.grid, stats: plan.stats, rasterized } : null, count: analysis.count, missing: result.missing, blob: await png.encode(result.rgba, w, h) });
       } else if (action === 'attachments') {
         const items = [];
         if (attachedFiles.size + message.files.length > 32) throw new Error('最多附加 32 张图片');
@@ -147,7 +153,7 @@ function workerMain() {
           if (!steg.equal(restored.original, rgba) || !steg.equal(restored.base, result.base) || restored.text !== message.text || !steg.sameAttachments(restored.attachments, extraImages)) throw new Error('导出 PNG 的恢复校验失败');
           if (variants.length !== restored.differences.length || variants.some((node, index) => !steg.equal(node.rgba, restored.differences[index].rgba))) throw new Error('导出 PNG 的差分图校验失败');
         }
-        self.postMessage({ id, action, done: true, w, h, fits: result.fits, bytes: result.bytes, baseBlob, carrierBlob, methods: result.methods, textBytes: result.textBytes }, [result.bytes.buffer]);
+        self.postMessage({ id, action, done: true, w, h, fits: result.fits, bytes: result.bytes, baseBlob, carrierBlob, methods: diff.summarizeMethods(result.methods), textBytes: result.textBytes }, [result.bytes.buffer]);
       } else if (action === 'restore') {
         const result = await steg.restore(rgba, w, h, progress);
         if (!result.detected) { self.postMessage({ id, action, done: true, detected: false }); return; }
@@ -182,6 +188,7 @@ function setBusy(value) {
   for (const input of $('difference-list').querySelectorAll('button,select')) input.disabled = value || input.dataset.unavailable === 'true';
   for (const row of $('difference-list').children) row.classList.toggle('clickable-row', !value);
   $('edit-base').disabled = value || !image;
+  $('selection-settings').disabled = value || !image;
   $('add-differences').disabled = value; $('difference-files').disabled = value;
   if (value) closeGenerateMenu();
   for (const button of $('attachment-list').querySelectorAll('button')) button.disabled = value || button.dataset.unavailable === 'true';
@@ -279,11 +286,11 @@ function receive(data) {
     if (data.revision !== revision || data.nodeId !== activeDifferenceId || creationKind !== 'difference' || rawPreview || mode !== 'encode') return;
     if (data.error) { status(data.error, true); $('diff-status').textContent = data.error; return; }
     const node = activeDifference(); if (!node) return;
-    node.count = data.count; node.missing = data.missing; node.chunk = data.chunk;
+    node.count = data.count; node.missing = data.missing; node.chunk = data.chunk; node.resultBoxCount = data.boxCount;
     if (node.policy !== 'manual') { node.regions = data.boxes.map(r => ({ ...r, mode: 'mosaic' })); regions = node.regions; selectedIndex = -1; }
     if (previewURL) URL.revokeObjectURL(previewURL); previewURL = URL.createObjectURL(data.blob); $('preview').src = previewURL;
     const stats = data.chunk?.stats;
-    $('diff-status').textContent = `差异 ${format(data.count)} 像素 · 未覆盖 ${format(data.missing)} 像素 · ${data.boxes.length} 个框${stats ? `；${stats.total} 个分块，变化 ${stats.active}，收缩 ${stats.shrunk}，未收缩 ${stats.unshrunk} → ${stats.retained} 个矩形（合并减少 ${stats.saved} 个）` : ''}`;
+    $('diff-status').textContent = `差异 ${format(data.count)} 像素 · 未覆盖 ${format(data.missing)} 像素 · ${data.boxCount ?? data.boxes.length} 个框${stats ? `；${stats.total} 个分块，变化 ${stats.active}，收缩 ${stats.shrunk}，未收缩 ${stats.unshrunk} → ${stats.retained} 个矩形（合并减少 ${stats.saved} 个）` : ''}`;
     $('diff-status').classList.toggle('error', data.missing > 0); renderRegions(); setBusy(busy); return;
   }
   if (data.action === 'preview') {
@@ -305,7 +312,7 @@ function receive(data) {
     $('preview-box').hidden = false; $('dropzone').hidden = true;
     $('selection-overlay').setAttribute('viewBox', `0 0 ${data.w} ${data.h}`);
     $('dimensions').textContent = `${format(data.w)} × ${format(data.h)} px`; $('source-info').textContent = data.source;
-    $('detection').textContent = data.detectionError || (data.detected ? (mode === 'decode' ? '发现 ImgSteg 标记，正在自动提取并校验。' : '发现 ImgSteg 标记，可切换到“识别与还原”提取内容。') : '未发现本项目的 ImgSteg v1/v2/v3/v4/v5/v6 标记。');
+    $('detection').textContent = data.detectionError || (data.detected ? (mode === 'decode' ? '发现 ImgSteg 标记，正在自动提取并校验。' : '发现 ImgSteg 标记，可切换到“识别与还原”提取内容。') : '未发现本项目的 ImgSteg v1/v2/v3/v4/v5/v6/v7 标记。');
     $('detection').classList.toggle('error', Boolean(data.detectionError));
     $('state').textContent = '就绪'; $('result-note').textContent = mode === 'decode' ? (data.detected ? '已识别隐写标记，正在提取恢复数据。' : '此图片未发现本项目的隐写格式。') : '框选区域、填写文字后，点击“计算并生成隐写 PNG”。';
     status('可在图片上拖出多个矩形选区。', false, 0); setBusy(false); renderRegions();
@@ -319,7 +326,7 @@ function receive(data) {
     sourceURL = chosen.previewURL; $('filename').textContent = chosen.name;
     const previous = next.find(node => node.id === chosen.id); previous.name = oldName; previous.previewURL = oldURL;
     differences = next; image.detected = data.detected; $('source-info').textContent = data.source;
-    $('detection').textContent = data.detected ? '发现 ImgSteg 标记，可切换到识别与还原。' : '未发现本项目的 ImgSteg v1/v2/v3/v4/v5/v6 标记。'; $('detection').classList.remove('error');
+    $('detection').textContent = data.detected ? '发现 ImgSteg 标记，可切换到识别与还原。' : '未发现本项目的 ImgSteg v1/v2/v3/v4/v5/v6/v7 标记。'; $('detection').classList.remove('error');
     resultCache.clear(); displayedKey = displayedAction = ''; editDifference(null); changed(); $('state').textContent = '已切换基底'; status('已重定向父本路径并迁移遮盖；图片、附图与文字均保留，无需重新上传。', false, 100);
   } else if (data.action === 'diff-manual') {
     const node = differences.find(item => item.id === data.nodeId); if (!node) return;
@@ -327,7 +334,7 @@ function receive(data) {
     if (activeDifferenceId === node.id) { regions = node.regions; selectedIndex = -1; }
     changed(); updateCreationView(); $('state').textContent = '待计算';
   } else if (data.action === 'diff-upload') {
-    for (const { previewBlob, ...item } of data.items) differences.push({ ...item, parentId: 'base', policy: 'auto', regions: [], previewURL: URL.createObjectURL(previewBlob) });
+    for (const { previewBlob, ...item } of data.items) differences.push({ ...item, parentId: 'base', policy: 'auto', maxBoxes: 20, chunkRows: 32, chunkCols: 32, regions: [], previewURL: URL.createObjectURL(previewBlob) });
     renderDifferences(); editDifference(data.items[0]?.id || null); changed(); status(`已添加 ${data.items.length} 张差分图，可为每张选择父本与编码方式。`, false, 100);
   } else if (data.action === 'attachments') {
     for (const item of data.items) { const { previewBlob, ...metadata } = item; attachments.push({ ...metadata, previewURL: URL.createObjectURL(previewBlob) }); }
@@ -416,7 +423,7 @@ function startTask(action) {
 }
 function activeDifference() { return differences.find(node => node.id === activeDifferenceId); }
 function regionsEditable() { return Boolean(image && mode === 'encode' && !rawPreview && (creationKind === 'cover' || activeDifference()?.policy === 'manual')); }
-function differenceMetadata() { return differences.map(node => ({ id: node.id, name: node.name, parentId: node.parentId, policy: node.policy, regions: node.regions.map(({ x, y, w, h }) => ({ x, y, w, h })) })); }
+function differenceMetadata() { return differences.map(node => ({ id: node.id, name: node.name, parentId: node.parentId, policy: node.policy, maxBoxes: node.maxBoxes ?? 20, chunkRows: node.chunkRows ?? 32, chunkCols: node.chunkCols ?? 32, regions: node.policy === 'manual' ? node.regions.map(({ x, y, w, h }) => ({ x, y, w, h })) : [] })); }
 function configuration(action) {
   const base = { action, regions: coverRegions, blockSize: blockSize() };
   if (action === 'build') {
@@ -496,7 +503,7 @@ function renderDifferences() {
     parentLabel.append(parent);
     const policyLabel = document.createElement('label'); policyLabel.textContent = '编码 ';
     const policy = document.createElement('select'); policy.setAttribute('aria-label', `差分图 ${index + 1} 编码方式`);
-    for (const [value, text] of [['auto', '自动框选（≤20）'], ['chunk', '32×32 分块自动'], ['manual', '手动框选'], ['full', '全图 XOR']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; policy.append(option); }
+    for (const [value, text] of [['auto', `自动框选（≤${node.maxBoxes ?? 20}）`], ['chunk', `${node.chunkRows ?? 32}×${node.chunkCols ?? 32} 分块自动`], ['manual', '手动框选'], ['full', '全图 XOR']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; policy.append(option); }
     policy.value = node.policy; policy.disabled = busy;
     policy.onchange = () => {
       if (node.policy === 'auto' && policy.value === 'manual') {
@@ -615,6 +622,7 @@ function renderOverlay(draft) {
   const overlay = $('selection-overlay'); overlay.replaceChildren();
   if (rawPreview) return;
   const chunkMode = activeDifference()?.policy === 'chunk', grid = activeDifference()?.chunk?.grid;
+  if (chunkMode && activeDifference()?.chunk?.rasterized) { $('selection-help').textContent = '分块模式只读：大规模网格和结果框已由 Worker 绘制；不提供手动调整。'; return; }
   if (chunkMode && grid) {
     for (const x of grid.xs) { const line = document.createElementNS(svgNS, 'line'); line.setAttribute('x1', x); line.setAttribute('x2', x); line.setAttribute('y1', 0); line.setAttribute('y2', image.h); line.setAttribute('class', 'chunk-grid'); overlay.append(line); }
     for (const y of grid.ys) { const line = document.createElementNS(svgNS, 'line'); line.setAttribute('x1', 0); line.setAttribute('x2', image.w); line.setAttribute('y1', y); line.setAttribute('y2', y); line.setAttribute('class', 'chunk-grid'); overlay.append(line); }
@@ -644,10 +652,33 @@ function renderOverlay(draft) {
   if (rawPreview) $('selection-help').textContent = '原色预览模式；点击编辑可修改选区。';
   else if (creationKind === 'difference' && !regionsEditable()) $('selection-help').textContent = activeDifference() ? '自动框选与全图 XOR 的选框只读；切换到手动框选后可编辑。' : '请先选择一张差分图进行预览或框选。';
 }
+function renderSelectionSettings() {
+  const node = activeDifference(), visible = mode === 'encode' && node && ['auto', 'chunk'].includes(node.policy);
+  $('selection-settings').hidden = !visible;
+  if (!visible) { selectionSettingsKey = ''; return; }
+  $('auto-settings').hidden = node.policy !== 'auto'; $('chunk-settings').hidden = node.policy !== 'chunk';
+  const key = JSON.stringify([node.id, node.policy, node.maxBoxes ?? 20, node.chunkRows ?? 32, node.chunkCols ?? 32]);
+  if (selectionSettingsKey !== key) {
+    selectionSettingsKey = key; $('auto-max-boxes').value = node.maxBoxes ?? 20; $('chunk-rows').value = node.chunkRows ?? 32; $('chunk-cols').value = node.chunkCols ?? 32;
+    $('selection-settings-note').classList.remove('error'); $('selection-settings-note').textContent = node.policy === 'auto' ? '1–256，默认 20；无可优化差异时可能少于上限。修改后点击应用。' : '行列各 1–65536，总分块不超过 65536；小图会减少到非空区间。修改后点击应用。';
+  }
+}
+function applySelectionSettings() {
+  const node = activeDifference(); if (busy || !image || !node || !['auto', 'chunk'].includes(node.policy)) return;
+  const maxBoxes = Number($('auto-max-boxes').value), chunkRows = Number($('chunk-rows').value), chunkCols = Number($('chunk-cols').value);
+  const invalid = node.policy === 'auto' ? !Number.isInteger(maxBoxes) || maxBoxes < 1 || maxBoxes > 256 : ![chunkRows, chunkCols].every(value => Number.isInteger(value) && value >= 1 && value <= 65536) || chunkRows * chunkCols > 65536;
+  if (invalid) { $('selection-settings-note').classList.add('error'); $('selection-settings-note').textContent = node.policy === 'auto' ? '尚未应用：最大选区数量须为 1–256 的整数。' : '尚未应用：行列须为 1–65536 的整数，且相乘不超过 65536。'; return; }
+  const same = node.policy === 'auto' ? maxBoxes === (node.maxBoxes ?? 20) : chunkRows === (node.chunkRows ?? 32) && chunkCols === (node.chunkCols ?? 32);
+  if (same) { $('selection-settings-note').classList.remove('error'); $('selection-settings-note').textContent = '参数未改变，已保留当前结果。'; return; }
+  if (node.policy === 'auto') node.maxBoxes = maxBoxes; else { node.chunkRows = chunkRows; node.chunkCols = chunkCols; }
+  rawPreview = false; baseOriginalPreview = false; node.regions = []; node.chunk = undefined; node.resultBoxCount = undefined; node.missing = undefined; regions = node.regions; selectedIndex = -1; drag = null;
+  changed(); updateCreationView(); status('已应用当前差分图参数，正在更新预览；生成时使用相同参数。', false, 0);
+}
 function renderRegions() {
+  renderSelectionSettings();
   const chunkMode = activeDifference()?.policy === 'chunk';
   $('chunk-legend').hidden = !chunkMode || rawPreview; $('region-buttons').hidden = chunkMode;
-  $('region-list').replaceChildren(); $('region-count').textContent = chunkMode ? `${regions.length} 个自动矩形` : `${regions.length} 个选区`; $('no-regions').hidden = regions.length !== 0;
+  $('region-list').replaceChildren(); $('region-count').textContent = chunkMode ? `${activeDifference()?.resultBoxCount ?? regions.length} 个自动矩形` : `${regions.length} 个选区`; $('no-regions').hidden = regions.length !== 0;
   if (chunkMode) { $('no-regions').hidden = true; if (rawPreview) $('selection-help').textContent = '原色预览模式；点击分块预览查看收缩与合并结果。'; renderOverlay(); return; }
   regions.forEach((r, index) => {
     const row = document.createElement('li'), title = document.createElement('div'); title.className = 'region-title'; row.classList.toggle('selected-region', index === selectedIndex);
@@ -748,6 +779,7 @@ $('clear-regions').onclick = () => { regions.length = 0; selectedIndex = -1; cha
 $('block-size').onchange = () => { $('block-size').value = blockSize(); changed(); };
 $('extra-text').oninput = () => { $('text-length').textContent = `${format(new TextEncoder().encode($('extra-text').value).length)} UTF-8 byte`; changed(false); };
 $('show-fill').onchange = schedulePreview;
+$('apply-selection-settings').onclick = applySelectionSettings;
 $('tab-encode').onclick = () => setMode('encode'); $('tab-decode').onclick = () => setMode('decode');
 $('generate').onclick = () => { closeGenerateMenu(); startTask('build'); }; $('analyze').onclick = () => { closeGenerateMenu(); startTask('analyze'); }; $('restore').onclick = () => startTask('restore');
 $('demo').onclick = () => openFile(null, true);

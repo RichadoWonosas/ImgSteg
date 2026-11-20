@@ -7,6 +7,11 @@ __FFLATE_SOURCE__
  const brotli = (() => {
 __BROTLI_SOURCE__
  return {init, compress, DecompressStream}; })();
+ const lzma = (() => {
+__LZMA_SOURCE__
+ return lzma_wasm;
+ })();
+__XZ_ADAPTER__
  const base64=__BROTLI_BASE64__;
  let brReady;
  function ready() {
@@ -31,10 +36,12 @@ __BROTLI_SOURCE__
    if(!consumed&&!chunk.length)throw new Error('Brotli 解码未推进');
   }finally{if(result)result.free();}}}finally{decoder.free();}
  }
- const api={ready, async available(format){return format==='deflate-js9'||format==='brotli-wasm11'&&await ready();},async run(bytes,format,decode,limit=160000000){
+ const api={ready,readyLzma,async available(format){if(format==='deflate-js9')return true;if(format==='brotli-wasm5'||format==='brotli-wasm11')return ready();if(format==='lzma2-xz3')return readyLzma();return false;},async run(bytes,format,decode,limit=160000000){
   if(!Number.isFinite(limit))limit=160000000;
+  if(!Number.isInteger(limit)||limit<0||limit>160000000)throw new Error('解压长度限制无效');
   if(format==='deflate-js9')return decode?inflate(bytes,limit):fflate.deflateSync(bytes,{level:9,mem:8});
-  if(format==='brotli-wasm11'){if(!await ready())throw new Error('Brotli WASM 不可用');return decode?unbrotli(bytes,limit):brotli.compress(bytes,{quality:11});}
+  if(format==='lzma2-xz3'){if(decode)return unxz(bytes,limit);if(!await readyLzma())throw new Error('LZMA2 WASM 不可用');if(!bytes.length)return Uint8Array.from([253,55,122,88,90,0,0,4,230,214,180,70,0,0,0,0,28,223,68,33,31,182,243,125,1,0,0,0,0,4,89,90]);return lzma.compress(bytes,{format:'xz',level:3});}
+  if(format==='brotli-wasm5'||format==='brotli-wasm11'){if(!await ready())throw new Error('Brotli WASM 不可用');return decode?unbrotli(bytes,limit):brotli.compress(bytes,{quality:format==='brotli-wasm11'?11:5});}
   throw new Error('未知本地压缩格式');
  }};
  return LocalCodecs.instance=api;

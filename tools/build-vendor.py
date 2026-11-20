@@ -11,4 +11,8 @@ brotli = brotli.replace("new URL('brotli_wasm_bg.wasm', import.meta.url)", 'null
 source = source.replace('__FFLATE_SOURCE__', (root / 'vendor/fflate.min.js').read_text(encoding='utf-8'))
 source = source.replace('__BROTLI_SOURCE__', brotli)
 source = source.replace('__BROTLI_BASE64__', repr(base64.b64encode((root / 'vendor/brotli_wasm_bg.wasm').read_bytes()).decode()))
+lzma = (root / 'vendor/lzma-wasm.iife.js').read_text(encoding='utf-8')
+lzma = lzma.replace('window.LzmaWasm = lzma_wasm;', '')
+source = source.replace('__LZMA_SOURCE__', lzma)
+source = source.replace('__XZ_ADAPTER__', (root / 'tools/xz-codec-adapter.js').read_text(encoding='utf-8'))
 (root / 'vendor-codecs.js').write_text(source, encoding='utf-8', newline='\n')

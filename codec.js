@@ -2,7 +2,7 @@
 function LsbCodec() {
   'use strict';
   const layouts = ['紧凑打包', 'RGB 低位值', '通道分离', '位平面', '横向差分', '纵向差分'];
-  const formats = ['raw', 'deflate-raw', 'deflate', 'gzip', 'brotli', 'zstd', 'deflate-js9', 'brotli-wasm11'];
+  const formats = ['raw', 'deflate-raw', 'deflate', 'gzip', 'brotli', 'zstd', 'deflate-js9', 'brotli-wasm5', 'lzma2-xz3'];
   const local = typeof LocalCodecs === 'function' ? LocalCodecs() : null;
   let algorithmPromise;
   function supportedAlgorithms() {
@@ -74,14 +74,14 @@ function LsbCodec() {
   for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; table[n] = c >>> 0; }
   function crc(bytes) { let c = 0xffffffff; for (const b of bytes) c = table[(c ^ b) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
   async function stream(bytes, format, decode = false, limit = Infinity) {
-    if (format === 'deflate-js9' || format === 'brotli-wasm11') {
+    if (format === 'deflate-js9' || format === 'brotli-wasm5' || format === 'brotli-wasm11' || format === 'lzma2-xz3') {
       if (!local) throw new Error('此分块需要新版 ImgSteg 内置编解码库');
       return local.run(bytes, format, decode, limit);
     }
     let codec;
     try { codec = decode ? new DecompressionStream(format) : new CompressionStream(format); }
     catch (error) {
-      if (local && format === 'brotli') return local.run(bytes, 'brotli-wasm11', decode, limit);
+      if (local && format === 'brotli') return local.run(bytes, 'brotli-wasm5', decode, limit);
       if (local && format === 'deflate-raw') return local.run(bytes, 'deflate-js9', decode, limit);
       throw error;
     }
@@ -130,7 +130,7 @@ function LsbCodec() {
     for (let l = 0; l < layouts.length; l++) {
       const data = transform(symbols, w, h, l);
       for (const a of supported) {
-        if (a === 7 && data.length > 8 * 1024 * 1024) { done++; continue; }
+        if ((a === 7 || a === 8) && data.length > 8 * 1024 * 1024 || a === 8 && best.length <= HEADER + 32) { done++; continue; }
         report({ progress: Math.round(15 + done / (layouts.length * supported.length) * 70), message: `正在比较 ${layouts[l]} / ${formats[a]}…` });
         const payload = await stream(data, formats[a]); tried++;
         if (payload.length + HEADER < best.length) { best = container(payload, w, h, l, a, checksum); bestLayout = l; bestAlgo = a; }

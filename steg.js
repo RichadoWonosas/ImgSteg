@@ -103,12 +103,13 @@ function ImgSteg() {
     if (![1, 3, 4].includes(channels) || data.length !== w * h * channels) throw new Error('全比特数据长度无效');
     const crc = low.crc(data);
     let best = byteContainer(data, w, h, channels, 0, 0, crc), method = '逐像素 / 原样存储';
+    if (data.length <= 4) return { bytes: best, method };
     const algorithms = await low.supportedAlgorithms();
     let done = 0;
     for (let layout = 0; layout < byteLayouts.length; layout++) {
       const transformed = byteTransform(data, w, h, channels, layout);
       for (const a of algorithms) {
-        if (a === 7 && transformed.length > 8 * 1024 * 1024) { done++; continue; }
+        if ((a === 7 || a === 8) && transformed.length > 8 * 1024 * 1024 || a === 8 && best.length <= 52) { done++; continue; }
         report({ progress: 100 * done++ / (byteLayouts.length * algorithms.length), message: `${byteLayouts[layout]} / ${low.formats[a]}` });
         const compressed = await low.stream(transformed, low.formats[a]);
         if (compressed.length + 20 < best.length) { best = byteContainer(compressed, w, h, channels, layout, a, crc); method = `${byteLayouts[layout]} / ${low.formats[a]}`; }
@@ -156,7 +157,7 @@ function ImgSteg() {
     if (rgba.length !== w * h * 4) throw new Error('载体像素长度无效');
     if (w * h * 9 < HEADER * 8) return { detected: false };
     const bytes = readCarrier(rgba, HEADER), v = viewOf(bytes);
-    if (!equal(bytes.subarray(0, 7), new Uint8Array(MAGIC.slice(0, 7))) || ![49, 50, 51, 52, 53, 54].includes(bytes[7])) return { detected: false };
+    if (!equal(bytes.subarray(0, 7), new Uint8Array(MAGIC.slice(0, 7))) || ![49, 50, 51, 52, 53, 54, 55].includes(bytes[7])) return { detected: false };
     const version = bytes[7] - 48, header = version >= 3 ? 64 : version === 2 ? 56 : HEADER;
     const length = v.getUint32(8), count = v.getUint32(20);
     if (length < header || length * 8 > w * h * 9 || v.getUint32(12) !== w || v.getUint32(16) !== h || count > MAX_REGIONS || v.getUint32(44) > MAX_TEXT + 20) throw new Error('发现 ImgSteg 标记，但文件头损坏或尺寸已改变');
@@ -200,10 +201,10 @@ function ImgSteg() {
       v.setUint32(0, r.x); v.setUint32(4, r.y); v.setUint32(8, r.w); v.setUint32(12, r.h); record[16] = modes.indexOf(r.mode); v.setUint32(20, block.bytes.length);
       parts.push(record, block.bytes); methods.push({ label: `选区 ${index + 1}`, method: block.method, bytes: block.bytes.length });
     }
-    let diffLength = 0, sparseDifferences = false, chunkedDifferences = false;
+    let diffLength = 0, sparseDifferences = false, chunkedDifferences = false, extendedDifferences = false;
     if (differences.length) {
       const block = await diffCodec.encode(differences, original, w, h, encodeBytes, stage(regions.length + 2, '压缩差分图'));
-      parts.push(block.bytes); diffLength = block.bytes.length; sparseDifferences = block.sparse; chunkedDifferences = block.chunked; methods.push(...block.methods);
+      parts.push(block.bytes); diffLength = block.bytes.length; sparseDifferences = block.sparse; chunkedDifferences = block.chunked; extendedDifferences = block.extended; methods.push(...block.methods);
     }
     let attachmentLength = 0;
     for (let index = 0; index < attachments.length; index++) {
@@ -223,7 +224,7 @@ function ImgSteg() {
     const length = header + parts.reduce((sum, p) => sum + p.length, 0), bytes = new Uint8Array(length), v = viewOf(bytes);
     bytes.set(MAGIC); v.setUint32(8, length); v.setUint32(12, w); v.setUint32(16, h); v.setUint32(20, regions.length);
     v.setUint32(24, lsb.bytes.length); v.setUint32(28, alphaLength); v.setUint32(32, low.crc(base)); v.setUint32(36, low.crc(original)); v.setUint32(44, textLength);
-    if (attachments.length || differences.length) { bytes[7] = differences.length ? (chunkedDifferences ? 54 : sparseDifferences ? 53 : regions.length ? 52 : 51) : 50; v.setUint32(48, attachments.length); v.setUint32(52, attachmentLength); }
+    if (attachments.length || differences.length) { bytes[7] = differences.length ? (extendedDifferences ? 55 : chunkedDifferences ? 54 : sparseDifferences ? 53 : regions.length ? 52 : 51) : 50; v.setUint32(48, attachments.length); v.setUint32(52, attachmentLength); }
     if (differences.length) { v.setUint32(56, differences.length); v.setUint32(60, diffLength); }
     let offset = header;
     for (const part of parts) { bytes.set(part, offset); offset += part.length; }

@@ -37,7 +37,7 @@ function DiffCodec() {
     const edges = new Map(), seen = new Set([rootId]), queue = [rootId];
     for (let i = 0; i < queue.length; i++) for (const next of neighbors.get(queue[i])) if (!seen.has(next.id)) {
       seen.add(next.id); queue.push(next.id);
-      edges.set(mapId(next.id), { parentId: mapId(queue[i]), policy: next.edge.policy, regions: (next.edge.regions || []).map(r => ({ ...r })) });
+      edges.set(mapId(next.id), { parentId: mapId(queue[i]), policy: next.edge.policy, maxBoxes: next.edge.maxBoxes ?? 20, chunkRows: next.edge.chunkRows ?? 32, chunkCols: next.edge.chunkCols ?? 32, regions: (next.edge.regions || []).map(r => ({ ...r })) });
     }
     const result = nodes.map(node => ({ ...node, ...edges.get(node.id) }));
     graph(result); return result;
@@ -111,7 +111,8 @@ function DiffCodec() {
     }
     return result.sort((a, b) => a.y - b.y || a.x - b.x);
   }
-  function autoBoxes(mask, w, h) {
+  function autoBoxes(mask, w, h, maxBoxes = 20) {
+    if (!Number.isInteger(maxBoxes) || maxBoxes < 1 || maxBoxes > 256) throw new Error('自动选区数量须为 1–256 的整数');
     // Adaptive tiles bound connected-component storage to 256 × 256 cells.
     // Each cell retains exact extrema of changed pixels, so coverage is exact.
     const size = Math.max(1, Math.ceil(Math.max(w, h) / 256)), cols = Math.ceil(w / size), rows = Math.ceil(h / size), cells = new Map();
@@ -140,7 +141,7 @@ function DiffCodec() {
       for (let i = 0; i < components.length; i += groupSize) grouped.push(components.slice(i, i + groupSize).reduce(union));
       components = grouped;
     }
-    while (components.length > 10) {
+    while (components.length > Math.min(10, maxBoxes)) {
       let bestA = 0, bestB = 1, bestCost = Infinity, merged;
       for (let a = 0; a < components.length; a++) for (let b = a + 1; b < components.length; b++) {
         const ra = components[a], rb = components[b], combined = union(ra, rb);
@@ -150,7 +151,7 @@ function DiffCodec() {
       }
       components[bestA] = merged; components.splice(bestB, 1);
     }
-    return refineBoxes(mask, w, components, 20);
+    return refineBoxes(mask, w, components, maxBoxes);
   }
   function mergeChunks(cells, cols, rows) {
     function sweep(transpose) {
@@ -170,8 +171,9 @@ function DiffCodec() {
       return transpose ? boxes.map(r => ({ x: r.y, y: r.x, w: r.h, h: r.w })) : boxes;
     }
     function largestFirst(wide) {
-      const remaining = cells.slice(), boxes = [];
+      const remaining = cells.slice(), boxes = []; let work = 0;
       while (remaining.some(Boolean)) {
+        if ((work += cols * rows) > 4 * 1024 * 1024) return null;
         const heights = new Int32Array(cols); let best = { x: 0, y: 0, w: 0, h: 0 };
         for (let y = 0; y < rows; y++) {
           const stack = [];
@@ -203,13 +205,14 @@ function DiffCodec() {
       }
       return boxes;
     }
-    const candidates = [sweep(false), sweep(true), largestFirst(true), largestFirst(false)].map(joinNeighbors);
+    const candidates = [sweep(false), sweep(true), largestFirst(true), largestFirst(false)].filter(Boolean).map(joinNeighbors);
     const perimeter = boxes => boxes.reduce((sum, r) => sum + r.w + r.h, 0);
     candidates.sort((a, b) => a.length - b.length || perimeter(a) - perimeter(b)); return candidates[0];
   }
-  function chunkBoxes(mask, w, h) {
+  function chunkBoxes(mask, w, h, requestedRows = 32, requestedCols = 32) {
+    if (![requestedRows, requestedCols].every(value => Number.isInteger(value) && value >= 1 && value <= 65536) || requestedRows * requestedCols > 65536) throw new Error('分块行列须为 1–65536 的整数，且总分块数不能超过 65536');
     if (!Number.isInteger(w) || !Number.isInteger(h) || w < 1 || h < 1 || w * h > MAX_PIXELS || mask.length !== w * h) throw new Error('分块掩码尺寸无效');
-    const cols = Math.min(32, w), rows = Math.min(32, h), xs = Array.from({ length: cols + 1 }, (_, i) => Math.floor(i * w / cols)), ys = Array.from({ length: rows + 1 }, (_, i) => Math.floor(i * h / rows));
+    const cols = Math.min(requestedCols, w), rows = Math.min(requestedRows, h), xs = Array.from({ length: cols + 1 }, (_, i) => Math.floor(i * w / cols)), ys = Array.from({ length: rows + 1 }, (_, i) => Math.floor(i * h / rows));
     const full = new Uint8Array(cols * rows), shrunk = []; let active = 0, unshrunk = 0;
     for (let cy = 0; cy < rows; cy++) for (let cx = 0; cx < cols; cx++) {
       const left = xs[cx], right = xs[cx + 1], top = ys[cy], bottom = ys[cy + 1]; let minX = right, minY = bottom, maxX = -1, maxY = -1;
@@ -220,13 +223,24 @@ function DiffCodec() {
       else shrunk.push({ x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1, kind: 'shrunk', cells: 1 });
     }
     const merged = mergeChunks(full, cols, rows).map(r => ({ x: xs[r.x], y: ys[r.y], w: xs[r.x + r.w] - xs[r.x], h: ys[r.y + r.h] - ys[r.y], kind: r.w * r.h > 1 ? 'merged' : 'cell', cells: r.w * r.h }));
-    return { boxes: [...shrunk, ...merged].sort((a, b) => a.y - b.y || a.x - b.x), grid: { cols, rows, xs, ys }, stats: { total: cols * rows, active, shrunk: shrunk.length, unshrunk, retained: merged.length, merged: merged.filter(r => r.cells > 1).length, saved: unshrunk - merged.length } };
+    return { boxes: [...shrunk, ...merged].sort((a, b) => a.y - b.y || a.x - b.x), grid: { cols, rows, xs, ys, requestedRows, requestedCols }, stats: { total: cols * rows, active, shrunk: shrunk.length, unshrunk, retained: merged.length, merged: merged.filter(r => r.cells > 1).length, saved: unshrunk - merged.length } };
   }
-  function chunkPlan(analysis, w, h) { return analysis.chunkPlan ||= chunkBoxes(analysis.mask, w, h); }
+  function cachedPlan(analysis, name, key, create) {
+    const plans = analysis[name] ||= new Map();
+    if (!plans.has(key)) { plans.set(key, create()); while (plans.size > 4) plans.delete(plans.keys().next().value); }
+    return plans.get(key);
+  }
+  function autoPlan(analysis, w, h, maxBoxes = 20) {
+    if (maxBoxes === 20) return analysis.boxes;
+    return cachedPlan(analysis, 'autoPlans', maxBoxes, () => autoBoxes(analysis.mask, w, h, maxBoxes));
+  }
+  function chunkPlan(analysis, w, h, rows = 32, cols = 32) {
+    return cachedPlan(analysis, 'chunkPlans', `${rows}:${cols}`, () => chunkBoxes(analysis.mask, w, h, rows, cols));
+  }
   function boxesFor(node, analysis, w, h) {
-    if (node.policy === 'chunk') return chunkPlan(analysis, w, h).boxes;
+    if (node.policy === 'chunk') return chunkPlan(analysis, w, h, node.chunkRows ?? 32, node.chunkCols ?? 32).boxes;
     if (node.policy === 'full') return [{ x: 0, y: 0, w, h }];
-    if (node.policy === 'auto') return analysis.boxes;
+    if (node.policy === 'auto') return autoPlan(analysis, w, h, node.maxBoxes ?? 20);
     boxesValid(node.regions, w, h); return node.regions;
   }
   function analyze(parent, child, w, h) {
@@ -239,17 +253,32 @@ function DiffCodec() {
     masks.set(key, result); while (masks.size > 2) masks.delete(masks.keys().next().value); return result;
   }
   function coverage(mask, w, h, boxes) {
-    boxesValid(boxes, w, h, 1024); const covered = new Uint8Array(w * h); let missing = 0;
-    for (let y = 0; y < h; y++) {
-      const spans = boxes.filter(r => y >= r.y && y < r.y + r.h).map(r => [r.x, r.x + r.w]).sort((a, b) => a[0] - b[0]);
-      let start = -1, end = -1;
-      for (const [left, right] of spans) {
-        if (left > end) { if (start >= 0) covered.fill(1, y * w + start, y * w + end); start = left; end = right; } else end = Math.max(end, right);
-      }
-      if (start >= 0) covered.fill(1, y * w + start, y * w + end);
-      for (let x = 0; x < w; x++) if (mask[y * w + x] && !covered[y * w + x]) missing++;
+    boxesValid(boxes, w, h, 65536); const covered = new Uint8Array(w * h), events = new Map(); let missing = 0;
+    const addEvent = (y, event) => { if (!events.has(y)) events.set(y, []); events.get(y).push(event); };
+    boxes.forEach((r, i) => { addEvent(r.y, { i, r, enter: true }); addEvent(r.y + r.h, { i, enter: false }); });
+    const rows = [...events.keys()].sort((a, b) => a - b), active = new Map();
+    for (let row = 0; row < rows.length - 1; row++) {
+      for (const event of events.get(rows[row])) if (event.enter) active.set(event.i, event.r); else active.delete(event.i);
+      const spans = [...active.values()].map(r => [r.x, r.x + r.w]).sort((a, b) => a[0] - b[0]), merged = [];
+      for (const span of spans) { const previous = merged[merged.length - 1]; if (previous && span[0] <= previous[1]) previous[1] = Math.max(previous[1], span[1]); else merged.push(span.slice()); }
+      for (let y = rows[row]; y < rows[row + 1]; y++) for (const [left, right] of merged) covered.fill(1, y * w + left, y * w + right);
     }
+    for (let p = 0; p < mask.length; p++) if (mask[p] && !covered[p]) missing++;
     return { covered, missing };
+  }
+  function rasterChunkPreview(rgba, w, h, plan) {
+    const paint = (x, y, color, blend = false) => {
+      x = Math.min(w - 1, x); y = Math.min(h - 1, y); if (x < 0 || y < 0) return;
+      const i = (y * w + x) * 4; for (let c = 0; c < 3; c++) rgba[i + c] = blend ? Math.round(rgba[i + c] * 0.65 + color[c] * 0.35) : color[c]; rgba[i + 3] = 255;
+    };
+    for (const x of plan.grid.xs) for (let y = 0; y < h; y++) paint(x, y, [153, 153, 153], true);
+    for (const y of plan.grid.ys) for (let x = 0; x < w; x++) paint(x, y, [153, 153, 153], true);
+    for (const r of plan.boxes) {
+      const color = r.kind === 'shrunk' ? [233, 154, 53] : r.kind === 'merged' ? [50, 183, 128] : [169, 112, 229];
+      for (let x = r.x; x < r.x + r.w; x++) { paint(x, r.y, color); paint(x, r.y + r.h - 1, color); }
+      for (let y = r.y; y < r.y + r.h; y++) { paint(r.x, y, color); paint(r.x + r.w - 1, y, color); }
+    }
+    return rgba;
   }
   function preview(child, analysis, w, h, boxes) {
     const { covered, missing } = coverage(analysis.mask, w, h, boxes), rgba = new Uint8Array(child.length);
@@ -276,6 +305,17 @@ function DiffCodec() {
     bytes.set([83, 80, 88, 49]); v.setUint32(4, w); v.setUint32(8, h); v.setUint32(12, count); v.setUint32(16, low.crc(xor)); bytes.set(compressed.bytes, 20);
     return { bytes, method: `稀疏掩码＋变化 RGBA / ${compressed.method}`, sparse: true, denseBytes: dense.bytes.length };
   }
+  const patchContents = new Map(); let patchContentBytes = 0;
+  async function cachedPatch(xor, w, h, encodeBytes) {
+    if (xor.length > 4096) return encodePatch(xor, w, h, encodeBytes);
+    const key = `${w}:${h}:${low.crc(xor)}`, previous = patchContents.get(key);
+    if (previous && previous.data.every((value, i) => value === xor[i])) return previous.block;
+    const block = await encodePatch(xor, w, h, encodeBytes);
+    if (previous) patchContentBytes -= previous.data.length + previous.block.bytes.length;
+    patchContents.set(key, { data: xor.slice(), block }); patchContentBytes += xor.length + block.bytes.length;
+    while (patchContents.size > 256 || patchContentBytes > 4 * 1024 * 1024) { const first = patchContents.keys().next().value, item = patchContents.get(first); patchContentBytes -= item.data.length + item.block.bytes.length; patchContents.delete(first); }
+    return block;
+  }
   async function decodePatch(bytes, w, h, decodeBytes, allowSparse = true) {
     const sparse = bytes.length >= 4 && String.fromCharCode(...bytes.subarray(0, 4)) === 'SPX1';
     if (!sparse) {
@@ -301,7 +341,7 @@ function DiffCodec() {
   async function encode(nodes, base, w, h, encodeBytes, report = () => {}) {
     graph(nodes);
     if (nodes.length * w * h > MAX_PIXELS) throw new Error('差分图合计最多 4000 万像素');
-    const byId = new Map(nodes.map(node => [node.id, node])), parts = [], methods = []; let sparse = false; const chunked = nodes.some(node => node.policy === 'chunk');
+    const byId = new Map(nodes.map(node => [node.id, node])), parts = [], methods = []; let sparse = false; const chunked = nodes.some(node => node.policy === 'chunk'), extended = nodes.some(node => node.policy === 'auto' && (node.maxBoxes ?? 20) > 64 || node.policy === 'chunk' && (node.chunkRows ?? 32) * (node.chunkCols ?? 32) > 1024);
     for (const [index, node] of nodes.entries()) {
       const parent = node.parentId === 'base' ? base : byId.get(node.parentId).rgba;
       if (!['auto', 'manual', 'full', 'chunk'].includes(node.policy)) throw new Error('差分图编码方式无效');
@@ -309,8 +349,11 @@ function DiffCodec() {
       if (coverage(analysis.mask, w, h, boxes).missing) throw new Error(`差分图「${node.name}」的选框未完全覆盖差异像素`);
       const name = new TextEncoder().encode(node.name);
       if (!name.length || name.length > 1024) throw new Error('差分图名称无效或过长');
-      const header = new Uint8Array(16 + name.length), hv = view(header);
-      hv.setUint16(0, name.length); hv.setUint16(2, boxes.length); hv.setUint32(4, node.parentId === 'base' ? 0 : nodes.findIndex(item => item.id === node.parentId) + 1); hv.setUint32(8, low.crc(node.rgba)); header.set(name, 16); parts.push(header);
+      const headerSize = extended ? 20 : 16, header = new Uint8Array(headerSize + name.length), hv = view(header), parentIndex = node.parentId === 'base' ? 0 : nodes.findIndex(item => item.id === node.parentId) + 1;
+      hv.setUint16(0, name.length);
+      if (extended) { hv.setUint16(2, node.policy === 'chunk' ? 1 : node.policy === 'auto' ? 2 : 0); hv.setUint32(4, boxes.length); hv.setUint32(8, parentIndex); hv.setUint32(12, low.crc(node.rgba)); }
+      else { hv.setUint16(2, boxes.length); hv.setUint32(4, parentIndex); hv.setUint32(8, low.crc(node.rgba)); }
+      header.set(name, headerSize); parts.push(header);
       for (const [patchIndex, r] of boxes.entries()) {
         report({ progress: 100 * (index + patchIndex / Math.max(1, boxes.length)) / Math.max(1, nodes.length), message: `差分图 ${index + 1} / XOR 区域 ${patchIndex + 1}` });
         const key = `${pairKey(parent, node.rgba)}:${w}:${r.x},${r.y},${r.w},${r.h}`;
@@ -318,9 +361,9 @@ function DiffCodec() {
         if (!block) {
           const xor = new Uint8Array(r.w * r.h * 4);
           for (let y = 0; y < r.h; y++) for (let x = 0; x < r.w; x++) for (let c = 0; c < 4; c++) { const dest = (y * r.w + x) * 4 + c, src = ((r.y + y) * w + r.x + x) * 4 + c; xor[dest] = parent[src] ^ node.rgba[src]; }
-          block = await encodePatch(xor, r.w, r.h, encodeBytes);
+          block = await cachedPatch(xor, r.w, r.h, encodeBytes);
           patches.set(key, block); cacheBytes += block.bytes.length;
-          while (cacheBytes > 32 * 1024 * 1024 && patches.size > 1) { const first = patches.keys().next().value; cacheBytes -= patches.get(first).bytes.length; patches.delete(first); }
+          while (patches.size > 4096 || cacheBytes > 32 * 1024 * 1024 && patches.size > 1) { const first = patches.keys().next().value; cacheBytes -= patches.get(first).bytes.length; patches.delete(first); }
         }
         sparse ||= block.sparse;
         const record = new Uint8Array(20), rv = view(record);
@@ -329,25 +372,38 @@ function DiffCodec() {
       }
     }
     const bytes = new Uint8Array(20 + parts.reduce((sum, part) => sum + part.length, 0)), v = view(bytes);
-    bytes.set([68, 73, 70, chunked ? 51 : sparse ? 50 : 49]); v.setUint32(4, nodes.length); v.setUint32(8, w); v.setUint32(12, h); v.setUint32(16, low.crc(base));
-    let offset = 20; for (const part of parts) { bytes.set(part, offset); offset += part.length; } return { bytes, methods, sparse, chunked };
+    bytes.set([68, 73, 70, extended ? 52 : chunked ? 51 : sparse ? 50 : 49]); v.setUint32(4, nodes.length); v.setUint32(8, w); v.setUint32(12, h); v.setUint32(16, low.crc(base));
+    let offset = 20; for (const part of parts) { bytes.set(part, offset); offset += part.length; } return { bytes, methods, sparse, chunked, extended };
+  }
+  function summarizeMethods(methods, limit = 256) {
+    if (methods.length <= limit) return methods;
+    const groups = new Map();
+    for (const item of methods) {
+      const label = item.label.replace(/ · XOR \d+$/, ' · XOR'), key = `${label}:${item.method}:${Boolean(item.sparse)}`;
+      let group = groups.get(key);
+      if (!group) { group = { ...item, label, bytes: 0, blocks: 0, denseBytes: item.denseBytes === undefined ? undefined : 0 }; groups.set(key, group); }
+      group.bytes += item.bytes; group.blocks++; if (group.denseBytes !== undefined) group.denseBytes += item.denseBytes;
+    }
+    return [...groups.values()].map(item => ({ ...item, label: item.blocks > 1 ? `${item.label}（${item.blocks} 块汇总）` : item.label }));
   }
   async function decode(bytes, base, w, h, decodeBytes) {
-    if (bytes.length < 20 || !['DIF1', 'DIF2', 'DIF3'].includes(String.fromCharCode(...bytes.subarray(0, 4)))) throw new Error('差分区段文件头无效');
-    const v = view(bytes), count = v.getUint32(4), allowSparse = bytes[3] >= 50, maxPatches = bytes[3] === 51 ? 1024 : 64;
+    if (bytes.length < 20 || !['DIF1', 'DIF2', 'DIF3', 'DIF4'].includes(String.fromCharCode(...bytes.subarray(0, 4)))) throw new Error('差分区段文件头无效');
+    const v = view(bytes), count = v.getUint32(4), allowSparse = bytes[3] >= 50, extended = bytes[3] === 52, maxPatches = bytes[3] === 51 ? 1024 : 64;
     if (count > MAX_NODES || count * w * h > MAX_PIXELS || v.getUint32(8) !== w || v.getUint32(12) !== h || v.getUint32(16) !== low.crc(base)) throw new Error('差分图数量、尺寸或基底校验失败');
     let offset = 20;
     const take = length => { if (length < 0 || length > bytes.length - offset) throw new Error('差分区段被截断'); const value = bytes.subarray(offset, offset + length); offset += length; return value; };
     const nodes = [];
     for (let index = 0; index < count; index++) {
-      const header = view(take(16)), nameLength = header.getUint16(0), patchCount = header.getUint16(2), parent = header.getUint32(4);
-      if (!nameLength || nameLength > 1024 || patchCount > maxPatches || parent > count || header.getUint32(12)) throw new Error('差分图记录无效');
-      const name = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(take(nameLength)), records = [];
+      const header = view(take(extended ? 20 : 16)), nameLength = header.getUint16(0), flags = extended ? header.getUint16(2) : 0, patchCount = extended ? header.getUint32(4) : header.getUint16(2), parent = header.getUint32(extended ? 8 : 4), crc = header.getUint32(extended ? 12 : 8);
+      const limit = extended ? flags === 1 ? 65536 : flags === 2 ? 256 : 64 : maxPatches;
+      if (!nameLength || nameLength > 1024 || flags > 2 || patchCount > limit || parent > count || header.getUint32(extended ? 16 : 12)) throw new Error('差分图记录无效');
+      const name = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(take(nameLength)), records = []; let patchArea = 0;
       for (let p = 0; p < patchCount; p++) {
         const rv = view(take(20)), r = { x: rv.getUint32(0), y: rv.getUint32(4), w: rv.getUint32(8), h: rv.getUint32(12) }; boxesValid([r], w, h);
+        patchArea += r.w * r.h; if (extended && flags === 1 && patchArea > w * h) throw new Error('分块累计面积超出图像');
         records.push({ ...r, bytes: take(rv.getUint32(16)) });
       }
-      nodes.push({ id: `diff-${index + 1}`, parentId: parent === 0 ? 'base' : `diff-${parent}`, name, records, crc: header.getUint32(8) });
+      nodes.push({ id: `diff-${index + 1}`, parentId: parent === 0 ? 'base' : `diff-${parent}`, name, records, crc });
     }
     if (offset !== bytes.length) throw new Error('差分区段含未定义尾部');
     for (const index of graph(nodes)) {
@@ -362,6 +418,6 @@ function DiffCodec() {
     }
     return nodes.map(({ id, parentId, name, rgba }) => ({ id, parentId, name, rgba, w, h }));
   }
-  return { graph, reroot, mergeChunks, chunkBoxes, chunkPlan, boxesFor, removeContained, bestSplit, refineBoxes, autoBoxes, analyze, coverage, preview, boxesValid, encodePatch, decodePatch, encode, decode };
+  return { graph, reroot, mergeChunks, chunkBoxes, chunkPlan, boxesFor, removeContained, bestSplit, refineBoxes, autoBoxes, autoPlan, analyze, coverage, rasterChunkPreview, preview, boxesValid, summarizeMethods, encodePatch, decodePatch, encode, decode };
 }
 if (typeof module !== 'undefined') module.exports = DiffCodec;
