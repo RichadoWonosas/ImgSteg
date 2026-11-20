@@ -200,7 +200,7 @@ function resetMetrics() {
   for (const id of ['bytes', 'pixels', 'method']) $(id).textContent = '—';
   for (const id of ['original', 'compressed', 'remaining-bits']) $(id).textContent = '— bit';
   for (const name of ['square', 'standard', 'wide']) { $(`raw-${name}-size`).textContent = '— × —'; $(`raw-${name}-pixels`).textContent = '— 像素'; }
-  $('compression-details').replaceChildren(); $('download').disabled = true; $('download').onclick = null;
+  $('compression-details').replaceChildren(); $('chunk-compression-list').replaceChildren(); $('chunk-compression').hidden = true; $('chunk-compression').open = false; $('download').disabled = true; $('download').onclick = null;
 }
 function clearOutputs() {
   for (const url of outputURLs) URL.revokeObjectURL(url); outputURLs.clear();
@@ -348,7 +348,10 @@ function receive(data) {
     if (mode === 'encode' && creationKind === 'cover' && !baseOriginalPreview && (rawPreview || $('show-fill').checked)) { if (previewURL) URL.revokeObjectURL(previewURL); previewURL = URL.createObjectURL(data.baseBlob); $('preview').src = previewURL; }
     const remaining = BigInt(data.w) * BigInt(data.h) * 9n - BigInt(data.bytes.length) * 8n;
     showMetrics(data.w, data.h, data.bytes.length, '各分块独立择优，详情见下方', data.fits ? '全部恢复数据与文字均可装入，已生成并验证隐写 PNG。' : `容量不足，超出 ${format(-remaining)} bit；请缩小选区、减少文字或更换图片。`);
-    for (const item of data.methods) { const row = document.createElement('li'); row.textContent = `${item.label}：${item.method} · ${format(item.bytes)} byte${item.sparse ? `（比整框节省 ${format(item.denseBytes - item.bytes)} byte）` : ''}`; $('compression-details').append(row); }
+    for (const item of data.methods) { const row = document.createElement('li'); row.textContent = `${item.label}：${item.method} · ${format(item.bytes)} byte${item.sparse ? `（比整框节省 ${format(item.denseBytes - item.bytes)} byte）` : ''}`; $(item.chunked ? 'chunk-compression-list' : 'compression-details').append(row); }
+    const chunkMethods = data.methods.filter(item => item.chunked);
+    $('chunk-compression').hidden = !chunkMethods.length; $('chunk-compression').open = false;
+    $('chunk-compression-summary').textContent = `分块压缩明细 · ${format(chunkMethods.reduce((sum, item) => sum + (item.blocks || 1), 0))} 块 · ${format(chunkMethods.reduce((sum, item) => sum + item.bytes, 0))} byte`;
     const overhead = data.bytes.length - data.methods.reduce((sum, item) => sum + item.bytes, 0);
     const row = document.createElement('li'); row.textContent = `容器头、选区与附加图片记录：${format(overhead)} byte`; $('compression-details').append(row);
     $('generated').hidden = false; attachDownload('download-base', data.baseBlob, 'ImgSteg-i2.png');
@@ -677,7 +680,10 @@ function applySelectionSettings() {
 function renderRegions() {
   renderSelectionSettings();
   const chunkMode = activeDifference()?.policy === 'chunk';
-  $('chunk-legend').hidden = !chunkMode || rawPreview; $('region-buttons').hidden = chunkMode;
+  $('chunk-legend').hidden = !chunkMode || rawPreview;
+  const chunkStats = activeDifference()?.chunk?.stats;
+  for (const [kind, count] of Object.entries({ grid: chunkStats?.total, shrunk: chunkStats?.shrunk, merged: chunkStats?.merged, cell: chunkStats ? chunkStats.retained - chunkStats.merged : undefined })) $('chunk-' + kind + '-count').textContent = count === undefined ? '—' : `${format(count)} 个`;
+  $('region-buttons').hidden = chunkMode;
   $('region-list').replaceChildren(); $('region-count').textContent = chunkMode ? `${activeDifference()?.resultBoxCount ?? regions.length} 个自动矩形` : `${regions.length} 个选区`; $('no-regions').hidden = regions.length !== 0;
   if (chunkMode) { $('no-regions').hidden = true; if (rawPreview) $('selection-help').textContent = '原色预览模式；点击分块预览查看收缩与合并结果。'; renderOverlay(); return; }
   regions.forEach((r, index) => {
@@ -715,6 +721,7 @@ function renderRegions() {
 }
 function setMode(next) {
   mode = next;
+  $('dock-generate').hidden = mode !== 'encode'; closeGenerateMenu();
   for (const current of ['encode', 'decode']) { $(`tab-${current}`).setAttribute('aria-selected', String(current === mode)); $(`${current}-controls`).hidden = current !== mode; }
   $('selection-overlay').hidden = mode === 'decode'; updateCreationView();
   if (mode === 'decode' && image?.detected && !busy) startTask('restore');

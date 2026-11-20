@@ -54,7 +54,7 @@ function DiffCodec() {
     let count = 0;
     for (let y = r.y; y < r.y + r.h; y++) for (let x = r.x; x < r.x + r.w; x++) count += Boolean(mask[y * w + x]);
     if (count < 2 || count === area(r)) return null;
-    let best = null, disconnected = null;
+    let best = null;
     // A one-pixel-wide/tall region only benefits from removing a gap.
     if (r.w === 1 || r.h === 1) {
       const vertical = r.h === 1, n = vertical ? r.w : r.h; let first = -1, last = -1, gap = 0, split = -1;
@@ -90,21 +90,21 @@ function DiffCodec() {
         const gain = area(r) - area(left) - area(right);
         if (gain > 0) {
           const plan = { boxes: [left, right], gain, axis, cut: (vertical ? r.x : r.y) + a + 1, disconnected: rightFirst - end > 1 };
-          if (!best || gain > best.gain) best = plan;
-          if (plan.disconnected && (!disconnected || gain > disconnected.gain)) disconnected = plan;
+          if (!best || gain > best.gain || gain === best.gain && plan.disconnected && !best.disconnected) best = plan;
         }
       }
     }
-    return disconnected || best;
+    return best;
   }
   function refineBoxes(mask, w, boxes, limit = 20) {
     let result = removeContained(boxes).map(r => ({ ...r })); const cuts = new Map();
     while (result.length < limit) {
-      const candidates = result.map((r, i) => ({ r, i })).sort((a, b) => area(b.r) - area(a.r) || a.i - b.i); let chosen;
-      for (const candidate of candidates) {
-        const r = candidate.r, key = `${r.x},${r.y},${r.w},${r.h}`;
+      let chosen;
+      for (const [i, r] of result.entries()) {
+        const key = `${r.x},${r.y},${r.w},${r.h}`;
         if (!cuts.has(key)) cuts.set(key, bestSplit(mask, w, r));
-        if (cuts.get(key)) { chosen = { ...candidate, split: cuts.get(key) }; break; }
+        const split = cuts.get(key);
+        if (split && (!chosen || split.gain > chosen.split.gain)) chosen = { i, split };
       }
       if (!chosen) break;
       result.splice(chosen.i, 1, ...chosen.split.boxes); result = removeContained(result);
@@ -368,7 +368,7 @@ function DiffCodec() {
         sparse ||= block.sparse;
         const record = new Uint8Array(20), rv = view(record);
         [r.x, r.y, r.w, r.h, block.bytes.length].forEach((value, i) => rv.setUint32(i * 4, value)); parts.push(record, block.bytes);
-        methods.push({ label: `差分图 ${index + 1} · XOR ${patchIndex + 1}`, method: block.method, bytes: block.bytes.length, denseBytes: block.denseBytes, sparse: block.sparse });
+        methods.push({ label: `差分图 ${index + 1} · XOR ${patchIndex + 1}`, method: block.method, bytes: block.bytes.length, denseBytes: block.denseBytes, sparse: block.sparse, chunked: node.policy === 'chunk' });
       }
     }
     const bytes = new Uint8Array(20 + parts.reduce((sum, part) => sum + part.length, 0)), v = view(bytes);

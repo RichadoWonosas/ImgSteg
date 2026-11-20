@@ -25,3 +25,8 @@ body{background:var(--page);color:var(--ink);padding-bottom:160px}main{max-width
 .selection-settings{margin:14px 26px;padding:12px;border:1px solid var(--border);border-radius:8px;color:var(--muted);font-size:12px}.selection-settings legend{padding:0 5px}.selection-settings>div{display:inline-flex;align-items:center;gap:8px;margin:0 8px 8px 0}.selection-settings input{width:76px;font-size:12px}.selection-settings button{font-size:11px;padding:7px 10px}.selection-settings p{font-size:10px;line-height:1.7;margin:4px 0 0}
 
 .selection-rect.chunk-cell{stroke:#a970e5}.chunk-legend .cell-swatch{border-color:#a970e5!important;background:#a970e5}
+
+/* Persistent generation controls and nested chunk details. */
+.capacity-dock{overflow:visible}.dock-actions{flex-wrap:wrap;justify-content:flex-end}.dock-actions .split-action{flex-shrink:0}.dock-actions .action-menu button{color:var(--ink);background:var(--soft)}.dock-details{border-radius:0 0 13px 13px}.dock-details>.chunk-compression{grid-column:1/-1}.chunk-compression{margin:0 22px 16px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;color:var(--muted);font-size:11px}.chunk-compression summary{cursor:pointer;color:var(--ink)}.chunk-compression .compression-details{padding:8px 0 0;margin:0;list-style-position:inside}.chunk-legend>span{display:flex;gap:7px;margin:2px 0}.chunk-legend b{font-weight:500;font-variant-numeric:tabular-nums;color:var(--ink)}
+@media(max-width:900px){.dock-summary{flex-wrap:wrap}.dock-actions{margin-left:auto}.dock-usage{flex:1}}
+@media(max-width:600px){body{padding-bottom:230px}.dock-actions{width:100%;justify-content:flex-end}.dock-actions .split-action{margin-right:auto}.chunk-compression{margin-left:15px;margin-right:15px}}
