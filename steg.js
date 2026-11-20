@@ -131,6 +131,32 @@ function ImgSteg() {
     if (low.crc(data) !== v.getUint32(16)) throw new Error('全比特数据校验失败');
     return { data, w, h, channels };
   }
+  async function encodeAlpha(alpha, w, h, report = () => {}) {
+    const legacy = await encodeBytes(alpha, w, h, 1, report), n = alpha.length, maskLength = Math.ceil(n / 8);
+    let count = 0; for (const v of alpha) if (v !== 255) count++;
+    if (maskLength + count >= n) return legacy;
+    const sparse = new Uint8Array(maskLength + count); let offset = maskLength;
+    for (let i = 0; i < n; i++) if (alpha[i] !== 255) { sparse[i >>> 3] |= 1 << (7 - (i & 7)); sparse[offset++] = alpha[i]; }
+    const block = await encodeBytes(sparse, sparse.length, 1, 1, report);
+    if (block.bytes.length + 20 >= legacy.bytes.length) return legacy;
+    const bytes = new Uint8Array(block.bytes.length + 20), v = viewOf(bytes); bytes.set([65, 76, 80, 49]); v.setUint32(4, w); v.setUint32(8, h); v.setUint32(12, count); v.setUint32(16, low.crc(alpha)); bytes.set(block.bytes, 20);
+    return { bytes, method: `Alpha 255默认值稀疏 / ${block.method}`, legacy };
+  }
+  async function decodeAlpha(bytes, w, h, allowSparse) {
+    dimensions(w, h);
+    if (!equal(bytes.subarray(0, 4), new Uint8Array([65, 76, 80, 49]))) return decodeBytes(bytes);
+    if (!allowSparse || bytes.length < 40) throw new Error('Alpha稀疏头无效');
+    const v = viewOf(bytes), n = w * h, maskLength = Math.ceil(n / 8), count = v.getUint32(12);
+    if (v.getUint32(4) !== w || v.getUint32(8) !== h || count > n || maskLength + count >= n) throw new Error('Alpha稀疏尺寸或计数无效');
+    const packet = bytes.subarray(20), pv = viewOf(packet);
+    if (pv.getUint32(4) !== maskLength + count || pv.getUint32(8) !== 1 || packet[12] !== 1) throw new Error('Alpha稀疏长度无效');
+    const { data } = await decodeBytes(packet);
+    if (n % 8 && data[maskLength - 1] & ((1 << (8 - n % 8)) - 1)) throw new Error('Alpha稀疏填充无效');
+    const alpha = new Uint8Array(n).fill(255); let offset = maskLength;
+    for (let i = 0; i < n; i++) if (data[i >>> 3] & (1 << (7 - (i & 7)))) { if (offset >= data.length || data[offset] === 255) throw new Error('Alpha稀疏例外无效'); alpha[i] = data[offset++]; }
+    if (offset !== data.length || low.crc(alpha) !== v.getUint32(16)) throw new Error('Alpha稀疏计数或校验失败');
+    return { data: alpha, w, h, channels: 1 };
+  }
   // Only the first requested bytes are read. No full-capacity allocation for detection.
   function readCarrier(rgba, byteLength) {
     if (byteLength * 8 > rgba.length / 4 * 9) throw new Error('隐写长度超出图片低位容量');
@@ -157,7 +183,7 @@ function ImgSteg() {
     if (rgba.length !== w * h * 4) throw new Error('载体像素长度无效');
     if (w * h * 9 < HEADER * 8) return { detected: false };
     const bytes = readCarrier(rgba, HEADER), v = viewOf(bytes);
-    if (!equal(bytes.subarray(0, 7), new Uint8Array(MAGIC.slice(0, 7))) || ![49, 50, 51, 52, 53, 54, 55].includes(bytes[7])) return { detected: false };
+    if (!equal(bytes.subarray(0, 7), new Uint8Array(MAGIC.slice(0, 7))) || ![49, 50, 51, 52, 53, 54, 55, 56].includes(bytes[7])) return { detected: false };
     const version = bytes[7] - 48, header = version >= 3 ? 64 : version === 2 ? 56 : HEADER;
     const length = v.getUint32(8), count = v.getUint32(20);
     if (length < header || length * 8 > w * h * 9 || v.getUint32(12) !== w || v.getUint32(16) !== h || count > MAX_REGIONS || v.getUint32(44) > MAX_TEXT + 20) throw new Error('发现 ImgSteg 标记，但文件头损坏或尺寸已改变');
@@ -166,7 +192,7 @@ function ImgSteg() {
     if (version >= 2) {
       const extra = viewOf(readCarrier(rgba, header)); attachmentCount = extra.getUint32(48); attachmentLength = extra.getUint32(52);
       if (attachmentCount > MAX_ATTACHMENTS || attachmentLength > length - header || (attachmentCount === 0) !== (attachmentLength === 0)) throw new Error('附加图片计数或长度无效');
-      if (version >= 3) { diffCount = extra.getUint32(56); diffLength = extra.getUint32(60); if (!diffCount || diffCount > 16 || diffCount * w * h > MAX_PIXELS || diffLength < 20 || diffLength > length - header) throw new Error('差分图区段长度或数量无效'); }
+      if (version >= 3) { diffCount = extra.getUint32(56); diffLength = extra.getUint32(60); if ((version < 8 && !diffCount) || diffCount > 16 || diffCount * w * h > MAX_PIXELS || (diffCount === 0 ? diffLength !== 0 : diffLength < 20) || diffLength > length - header) throw new Error('差分图区段长度或数量无效'); }
     }
     return { detected: true, length, count, version, header, attachmentCount, attachmentLength, diffCount, diffLength };
   }
@@ -176,7 +202,7 @@ function ImgSteg() {
     const originalCRC = low.crc(original);
     if (cachedOriginal !== original || cachedCRC !== originalCRC) { compressedCache.clear(); compressedBytes = 0; cachedOriginal = original; cachedCRC = originalCRC; }
     cacheHits = 0;
-    const header = differences.length ? 64 : attachments.length ? 56 : HEADER;
+    let header = differences.length ? 64 : attachments.length ? 56 : HEADER;
     const baseKey = `${w},${h},${blockSize}:` + JSON.stringify(regions);
     const base = makeBase(original, w, h, regions, blockSize);
     const textData = new TextEncoder().encode(text);
@@ -184,13 +210,13 @@ function ImgSteg() {
     if (textData.length > MAX_TEXT) throw new Error('附加文字 UTF-8 长度最多为 4 MiB');
     const parts = [], methods = [];
     const stage = (index, label) => update => report({ progress: 5 + 80 * (index + update.progress / 100) / (regions.length + attachments.length + (differences.length ? 1 : 0) + 3), message: `${label}：${update.message}` });
-    const lsb = await remembered(`low:${baseKey}`, () => low.encode(low.extract(base), w, h, stage(0, '压缩 i2 的低 3 位')));
+    let lsb = await remembered(`low:${baseKey}`, () => low.encode(low.extract(base), w, h, stage(0, '压缩 i2 的低 3 位')));
     parts.push(lsb.bytes); methods.push({ label: 'i2 LSB3', method: lsb.method, bytes: lsb.bytes.length });
     let alpha = new Uint8Array(w * h); let opaque = true;
     for (let p = 0; p < alpha.length; p++) { alpha[p] = base[p * 4 + 3]; if (alpha[p] !== 255) opaque = false; }
-    let alphaLength = 0;
+    let alphaLength = 0, alphaBlock;
     if (!opaque) {
-      const block = await remembered(`alpha:${baseKey}`, () => encodeBytes(alpha, w, h, 1, stage(1, '压缩透明通道')));
+      const block = await remembered(`alpha:${baseKey}`, () => encodeAlpha(alpha, w, h, stage(1, '压缩透明通道'))); alphaBlock = block;
       parts.push(block.bytes); alphaLength = block.bytes.length; methods.push({ label: 'i2 Alpha', method: block.method, bytes: alphaLength });
     }
     alpha = null;
@@ -201,10 +227,10 @@ function ImgSteg() {
       v.setUint32(0, r.x); v.setUint32(4, r.y); v.setUint32(8, r.w); v.setUint32(12, r.h); record[16] = modes.indexOf(r.mode); v.setUint32(20, block.bytes.length);
       parts.push(record, block.bytes); methods.push({ label: `选区 ${index + 1}`, method: block.method, bytes: block.bytes.length });
     }
-    let diffLength = 0, sparseDifferences = false, chunkedDifferences = false, extendedDifferences = false;
+    let diffLength = 0, sparseDifferences = false, chunkedDifferences = false, extendedDifferences = false, subtractedDifferences = false;
     if (differences.length) {
       const block = await diffCodec.encode(differences, original, w, h, encodeBytes, stage(regions.length + 2, '压缩差分图'));
-      parts.push(block.bytes); diffLength = block.bytes.length; sparseDifferences = block.sparse; chunkedDifferences = block.chunked; extendedDifferences = block.extended; methods.push(...block.methods);
+      parts.push(block.bytes); diffLength = block.bytes.length; sparseDifferences = block.sparse; chunkedDifferences = block.chunked; extendedDifferences = block.extended; subtractedDifferences = block.subtracted; methods.push(...block.methods);
     }
     let attachmentLength = 0;
     for (let index = 0; index < attachments.length; index++) {
@@ -221,10 +247,21 @@ function ImgSteg() {
       const block = await encodeBytes(textData, textData.length, 1, 1, stage(regions.length + attachments.length + 2, '压缩附加文字'));
       parts.push(block.bytes); textLength = block.bytes.length; methods.push({ label: '附加文字', method: block.method, bytes: textLength });
     }
+    // Compare complete sizes, including a possible upgrade from 48/56 to 64 bytes.
+    const sparseAlpha = Boolean(alphaBlock?.legacy), sparseLow = lsb.bytes[4] >= 6;
+    const savings = (sparseLow ? lsb.legacy.bytes.length - lsb.bytes.length : 0) + (sparseAlpha ? alphaBlock.legacy.bytes.length - alphaBlock.bytes.length : 0);
+    let modern = sparseLow || sparseAlpha || subtractedDifferences;
+    if (modern && !subtractedDifferences && savings <= 64 - header) {
+      if (sparseLow) { lsb = lsb.legacy; parts[0] = lsb.bytes; methods[0] = { label: 'i2 LSB3', method: lsb.method, bytes: lsb.bytes.length }; }
+      if (sparseAlpha) { alphaBlock = alphaBlock.legacy; parts[1] = alphaBlock.bytes; alphaLength = alphaBlock.bytes.length; methods[1] = { label: 'i2 Alpha', method: alphaBlock.method, bytes: alphaLength }; }
+      modern = false;
+    }
+    if (modern) header = 64;
     const length = header + parts.reduce((sum, p) => sum + p.length, 0), bytes = new Uint8Array(length), v = viewOf(bytes);
     bytes.set(MAGIC); v.setUint32(8, length); v.setUint32(12, w); v.setUint32(16, h); v.setUint32(20, regions.length);
     v.setUint32(24, lsb.bytes.length); v.setUint32(28, alphaLength); v.setUint32(32, low.crc(base)); v.setUint32(36, low.crc(original)); v.setUint32(44, textLength);
     if (attachments.length || differences.length) { bytes[7] = differences.length ? (extendedDifferences ? 55 : chunkedDifferences ? 54 : sparseDifferences ? 53 : regions.length ? 52 : 51) : 50; v.setUint32(48, attachments.length); v.setUint32(52, attachmentLength); }
+    if (modern) bytes[7] = 56;
     if (differences.length) { v.setUint32(56, differences.length); v.setUint32(60, diffLength); }
     let offset = header;
     for (const part of parts) { bytes.set(part, offset); offset += part.length; }
@@ -251,13 +288,15 @@ function ImgSteg() {
       const result = bytes.subarray(offset, offset + length); offset += length; return result;
     }
     report({ progress: 20, message: '正在恢复底图 i2 的原始低位…' });
-    const lsb = await low.decode(take(v.getUint32(24)));
+    const lowBytes = take(v.getUint32(24));
+    if (info.version < 8 && lowBytes[4] >= 6) throw new Error('此版本不允许低位稀疏分块');
+    const lsb = await low.decode(lowBytes);
     if (lsb.w !== w || lsb.h !== h) throw new Error('i2 低位尺寸不匹配');
     const base = new Uint8Array(carrier); let symbol = 0;
     for (let i = 0; i < base.length; i++) if ((i & 3) !== 3) base[i] = (base[i] & 248) | lsb.symbols[symbol++]; else base[i] = 255;
     const alphaLength = v.getUint32(28);
     if (alphaLength) {
-      const alpha = await decodeBytes(take(alphaLength));
+      const alpha = await decodeAlpha(take(alphaLength), w, h, info.version >= 8);
       if (alpha.w !== w || alpha.h !== h || alpha.channels !== 1) throw new Error('Alpha 通道尺寸不匹配');
       for (let p = 0; p < w * h; p++) base[p * 4 + 3] = alpha.data[p];
     }
@@ -277,7 +316,7 @@ function ImgSteg() {
     if (info.diffCount) {
       if (!diffCodec) throw new Error('当前环境未加载差分图解码器');
       report({ progress: 75, message: '正在沿父本路径恢复差分图…' });
-      differences = await diffCodec.decode(take(info.diffLength), info.version >= 4 ? original : base, w, h, decodeBytes);
+      differences = await diffCodec.decode(take(info.diffLength), info.version >= 4 ? original : base, w, h, decodeBytes, info.version >= 8);
       if (differences.length !== info.diffCount) throw new Error('差分图计数不匹配');
     }
     const attachments = [], attachmentStart = offset;
@@ -307,6 +346,6 @@ function ImgSteg() {
     report({ progress: 90, message: '原图、i2 和文字均已通过校验' });
     return { detected: true, original, base, text, regions, attachments, differences, version: info.version, w, h, length: bytes.length };
   }
-  return { build, restore, probe, embed, readCarrier, makeBase, crop, fill, encodeBytes, decodeBytes, byteTransform, validateRegions, validateAttachments, sameAttachments, modes, equal };
+  return { build, restore, probe, embed, readCarrier, makeBase, crop, fill, encodeBytes, decodeBytes, encodeAlpha, decodeAlpha, byteTransform, validateRegions, validateAttachments, sameAttachments, modes, equal };
 }
 if (typeof module !== 'undefined') module.exports = ImgSteg;

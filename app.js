@@ -132,7 +132,8 @@ function workerMain() {
         const base = steg.makeBase(rgba, w, h, message.regions, message.blockSize);
         const key = JSON.stringify([message.regions, message.blockSize]);
         if (key !== lowKey || !lowResult) { lowResult = await codec.encode(codec.extract(base), w, h, progress); lowKey = key; }
-        const result = { ...lowResult, bytes: lowResult.bytes.slice() };
+        const { legacy, ...analysis } = lowResult;
+        const result = { ...analysis, bytes: lowResult.bytes.slice() };
         self.postMessage({ id, action, done: true, w, h, ...result }, [result.bytes.buffer]);
       } else if (action === 'build') {
         const extraImages = [];
@@ -312,7 +313,7 @@ function receive(data) {
     $('preview-box').hidden = false; $('dropzone').hidden = true;
     $('selection-overlay').setAttribute('viewBox', `0 0 ${data.w} ${data.h}`);
     $('dimensions').textContent = `${format(data.w)} × ${format(data.h)} px`; $('source-info').textContent = data.source;
-    $('detection').textContent = data.detectionError || (data.detected ? (mode === 'decode' ? '发现 ImgSteg 标记，正在自动提取并校验。' : '发现 ImgSteg 标记，可切换到“识别与还原”提取内容。') : '未发现本项目的 ImgSteg v1/v2/v3/v4/v5/v6/v7 标记。');
+    $('detection').textContent = data.detectionError || (data.detected ? (mode === 'decode' ? '发现 ImgSteg 标记，正在自动提取并校验。' : '发现 ImgSteg 标记，可切换到“识别与还原”提取内容。') : '未发现本项目的 ImgSteg v1/v2/v3/v4/v5/v6/v7/v8 标记。');
     $('detection').classList.toggle('error', Boolean(data.detectionError));
     $('state').textContent = '就绪'; $('result-note').textContent = mode === 'decode' ? (data.detected ? '已识别隐写标记，正在提取恢复数据。' : '此图片未发现本项目的隐写格式。') : '框选区域、填写文字后，点击“计算并生成隐写 PNG”。';
     status('可在图片上拖出多个矩形选区。', false, 0); setBusy(false); renderRegions();
@@ -326,7 +327,7 @@ function receive(data) {
     sourceURL = chosen.previewURL; $('filename').textContent = chosen.name;
     const previous = next.find(node => node.id === chosen.id); previous.name = oldName; previous.previewURL = oldURL;
     differences = next; image.detected = data.detected; $('source-info').textContent = data.source;
-    $('detection').textContent = data.detected ? '发现 ImgSteg 标记，可切换到识别与还原。' : '未发现本项目的 ImgSteg v1/v2/v3/v4/v5/v6/v7 标记。'; $('detection').classList.remove('error');
+    $('detection').textContent = data.detected ? '发现 ImgSteg 标记，可切换到识别与还原。' : '未发现本项目的 ImgSteg v1/v2/v3/v4/v5/v6/v7/v8 标记。'; $('detection').classList.remove('error');
     resultCache.clear(); displayedKey = displayedAction = ''; editDifference(null); changed(); $('state').textContent = '已切换基底'; status('已重定向父本路径并迁移遮盖；图片、附图与文字均保留，无需重新上传。', false, 100);
   } else if (data.action === 'diff-manual') {
     const node = differences.find(item => item.id === data.nodeId); if (!node) return;
@@ -506,7 +507,7 @@ function renderDifferences() {
     parentLabel.append(parent);
     const policyLabel = document.createElement('label'); policyLabel.textContent = '编码 ';
     const policy = document.createElement('select'); policy.setAttribute('aria-label', `差分图 ${index + 1} 编码方式`);
-    for (const [value, text] of [['auto', `自动框选（≤${node.maxBoxes ?? 20}）`], ['chunk', `${node.chunkRows ?? 32}×${node.chunkCols ?? 32} 分块自动`], ['manual', '手动框选'], ['full', '全图 XOR']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; policy.append(option); }
+    for (const [value, text] of [['auto', `自动框选（≤${node.maxBoxes ?? 20}）`], ['chunk', `${node.chunkRows ?? 32}×${node.chunkCols ?? 32} 分块自动`], ['manual', '手动框选'], ['full', '全图差值（XOR / 循环减法择优）']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; policy.append(option); }
     policy.value = node.policy; policy.disabled = busy;
     policy.onchange = () => {
       if (node.policy === 'auto' && policy.value === 'manual') {
@@ -653,7 +654,7 @@ function renderOverlay(draft) {
     $('selection-help').textContent = `已选中选区 ${selectedIndex + 1} · ${rectEditor.labels[selectedPart]}。方向键每次调整 1 像素${['n', 's'].includes(selectedPart) ? '，仅上下键生效' : ['w', 'e'].includes(selectedPart) ? '，仅左右键生效' : ''}；Esc 取消选中。`;
   } else $('selection-help').textContent = '双击选框以选中；拖动内部移动，拖动边或角缩放。方向键每次微调 1 像素；Esc 取消选中后可继续画框。';
   if (rawPreview) $('selection-help').textContent = '原色预览模式；点击编辑可修改选区。';
-  else if (creationKind === 'difference' && !regionsEditable()) $('selection-help').textContent = activeDifference() ? '自动框选与全图 XOR 的选框只读；切换到手动框选后可编辑。' : '请先选择一张差分图进行预览或框选。';
+  else if (creationKind === 'difference' && !regionsEditable()) $('selection-help').textContent = activeDifference() ? '自动框选与全图差值 的选框只读；切换到手动框选后可编辑。' : '请先选择一张差分图进行预览或框选。';
 }
 function renderSelectionSettings() {
   const node = activeDifference(), visible = mode === 'encode' && node && ['auto', 'chunk'].includes(node.policy);

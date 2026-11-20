@@ -316,6 +316,24 @@ function DiffCodec() {
     while (patchContents.size > 256 || patchContentBytes > 4 * 1024 * 1024) { const first = patchContents.keys().next().value, item = patchContents.get(first); patchContentBytes -= item.data.length + item.block.bytes.length; patchContents.delete(first); }
     return block;
   }
+  function rememberPatch(key, block) {
+    patches.set(key, block); cacheBytes += block.bytes.length;
+    while (patches.size > 4096 || cacheBytes > 32 * 1024 * 1024 && patches.size > 1) { const first = patches.keys().next().value; cacheBytes -= patches.get(first).bytes.length; patches.delete(first); }
+    return block;
+  }
+  async function chooseDelta(xor, subtract, w, h, encodeBytes, xorBlock) {
+    const original = xorBlock || await cachedPatch(xor, w, h, encodeBytes);
+    let best = { ...original, method: `XOR / ${original.method}`, subtracted: false };
+    // A SUB1 wrapper adds four bytes; tiny raw blocks cannot beat XOR.
+    if (best.bytes.length > 24) {
+      const sub = await cachedPatch(subtract, w, h, encodeBytes);
+      if (sub.bytes.length + 4 < best.bytes.length) {
+        const bytes = new Uint8Array(4 + sub.bytes.length); bytes.set([83, 85, 66, 49]); bytes.set(sub.bytes, 4);
+        best = { ...sub, bytes, denseBytes: sub.denseBytes + 4, method: `模256减法 / ${sub.method}`, subtracted: true };
+      }
+    }
+    return best;
+  }
   async function decodePatch(bytes, w, h, decodeBytes, allowSparse = true) {
     const sparse = bytes.length >= 4 && String.fromCharCode(...bytes.subarray(0, 4)) === 'SPX1';
     if (!sparse) {
@@ -341,7 +359,7 @@ function DiffCodec() {
   async function encode(nodes, base, w, h, encodeBytes, report = () => {}) {
     graph(nodes);
     if (nodes.length * w * h > MAX_PIXELS) throw new Error('差分图合计最多 4000 万像素');
-    const byId = new Map(nodes.map(node => [node.id, node])), parts = [], methods = []; let sparse = false; const chunked = nodes.some(node => node.policy === 'chunk'), extended = nodes.some(node => node.policy === 'auto' && (node.maxBoxes ?? 20) > 64 || node.policy === 'chunk' && (node.chunkRows ?? 32) * (node.chunkCols ?? 32) > 1024);
+    const byId = new Map(nodes.map(node => [node.id, node])), parts = [], methods = []; let sparse = false, subtracted = false; const chunked = nodes.some(node => node.policy === 'chunk'), extended = nodes.some(node => node.policy === 'auto' && (node.maxBoxes ?? 20) > 64 || node.policy === 'chunk' && (node.chunkRows ?? 32) * (node.chunkCols ?? 32) > 1024);
     for (const [index, node] of nodes.entries()) {
       const parent = node.parentId === 'base' ? base : byId.get(node.parentId).rgba;
       if (!['auto', 'manual', 'full', 'chunk'].includes(node.policy)) throw new Error('差分图编码方式无效');
@@ -355,38 +373,38 @@ function DiffCodec() {
       else { hv.setUint16(2, boxes.length); hv.setUint32(4, parentIndex); hv.setUint32(8, low.crc(node.rgba)); }
       header.set(name, headerSize); parts.push(header);
       for (const [patchIndex, r] of boxes.entries()) {
-        report({ progress: 100 * (index + patchIndex / Math.max(1, boxes.length)) / Math.max(1, nodes.length), message: `差分图 ${index + 1} / XOR 区域 ${patchIndex + 1}` });
-        const key = `${pairKey(parent, node.rgba)}:${w}:${r.x},${r.y},${r.w},${r.h}`;
+        report({ progress: 100 * (index + patchIndex / Math.max(1, boxes.length)) / Math.max(1, nodes.length), message: `差分图 ${index + 1} / 差值区域 ${patchIndex + 1}` });
+        const geometry = `${w}:${r.x},${r.y},${r.w},${r.h}`, key = `delta:${identity(parent)}>${identity(node.rgba)}:${geometry}`, xorKey = `xor:${pairKey(parent, node.rgba)}:${geometry}`;
         let block = patches.get(key);
         if (!block) {
-          const xor = new Uint8Array(r.w * r.h * 4);
-          for (let y = 0; y < r.h; y++) for (let x = 0; x < r.w; x++) for (let c = 0; c < 4; c++) { const dest = (y * r.w + x) * 4 + c, src = ((r.y + y) * w + r.x + x) * 4 + c; xor[dest] = parent[src] ^ node.rgba[src]; }
-          block = await cachedPatch(xor, r.w, r.h, encodeBytes);
-          patches.set(key, block); cacheBytes += block.bytes.length;
-          while (patches.size > 4096 || cacheBytes > 32 * 1024 * 1024 && patches.size > 1) { const first = patches.keys().next().value; cacheBytes -= patches.get(first).bytes.length; patches.delete(first); }
+          const xor = new Uint8Array(r.w * r.h * 4), subtract = new Uint8Array(xor.length);
+          for (let y = 0; y < r.h; y++) for (let x = 0; x < r.w; x++) for (let c = 0; c < 4; c++) { const dest = (y * r.w + x) * 4 + c, src = ((r.y + y) * w + r.x + x) * 4 + c; xor[dest] = parent[src] ^ node.rgba[src]; subtract[dest] = (node.rgba[src] - parent[src] + 256) & 255; }
+          const xorBlock = patches.get(xorKey) || rememberPatch(xorKey, await cachedPatch(xor, r.w, r.h, encodeBytes));
+          block = rememberPatch(key, await chooseDelta(xor, subtract, r.w, r.h, encodeBytes, xorBlock));
         }
+        subtracted ||= block.subtracted;
         sparse ||= block.sparse;
         const record = new Uint8Array(20), rv = view(record);
         [r.x, r.y, r.w, r.h, block.bytes.length].forEach((value, i) => rv.setUint32(i * 4, value)); parts.push(record, block.bytes);
-        methods.push({ label: `差分图 ${index + 1} · XOR ${patchIndex + 1}`, method: block.method, bytes: block.bytes.length, denseBytes: block.denseBytes, sparse: block.sparse, chunked: node.policy === 'chunk' });
+        methods.push({ label: `差分图 ${index + 1} · 差值 ${patchIndex + 1}`, method: block.method, bytes: block.bytes.length, denseBytes: block.denseBytes, sparse: block.sparse, chunked: node.policy === 'chunk' });
       }
     }
     const bytes = new Uint8Array(20 + parts.reduce((sum, part) => sum + part.length, 0)), v = view(bytes);
     bytes.set([68, 73, 70, extended ? 52 : chunked ? 51 : sparse ? 50 : 49]); v.setUint32(4, nodes.length); v.setUint32(8, w); v.setUint32(12, h); v.setUint32(16, low.crc(base));
-    let offset = 20; for (const part of parts) { bytes.set(part, offset); offset += part.length; } return { bytes, methods, sparse, chunked, extended };
+    let offset = 20; for (const part of parts) { bytes.set(part, offset); offset += part.length; } return { bytes, methods, sparse, chunked, extended, subtracted };
   }
   function summarizeMethods(methods, limit = 256) {
     if (methods.length <= limit) return methods;
     const groups = new Map();
     for (const item of methods) {
-      const label = item.label.replace(/ · XOR \d+$/, ' · XOR'), key = `${label}:${item.method}:${Boolean(item.sparse)}`;
+      const label = item.label.replace(/ · (?:XOR|差值) \d+$/, ' · 差值'), key = `${label}:${item.method}:${Boolean(item.sparse)}`;
       let group = groups.get(key);
       if (!group) { group = { ...item, label, bytes: 0, blocks: 0, denseBytes: item.denseBytes === undefined ? undefined : 0 }; groups.set(key, group); }
       group.bytes += item.bytes; group.blocks++; if (group.denseBytes !== undefined) group.denseBytes += item.denseBytes;
     }
     return [...groups.values()].map(item => ({ ...item, label: item.blocks > 1 ? `${item.label}（${item.blocks} 块汇总）` : item.label }));
   }
-  async function decode(bytes, base, w, h, decodeBytes) {
+  async function decode(bytes, base, w, h, decodeBytes, allowSubtract = true) {
     if (bytes.length < 20 || !['DIF1', 'DIF2', 'DIF3', 'DIF4'].includes(String.fromCharCode(...bytes.subarray(0, 4)))) throw new Error('差分区段文件头无效');
     const v = view(bytes), count = v.getUint32(4), allowSparse = bytes[3] >= 50, extended = bytes[3] === 52, maxPatches = bytes[3] === 51 ? 1024 : 64;
     if (count > MAX_NODES || count * w * h > MAX_PIXELS || v.getUint32(8) !== w || v.getUint32(12) !== h || v.getUint32(16) !== low.crc(base)) throw new Error('差分图数量、尺寸或基底校验失败');
@@ -410,14 +428,16 @@ function DiffCodec() {
       const node = nodes[index], parent = node.parentId === 'base' ? base : nodes[Number(node.parentId.slice(5)) - 1].rgba;
       node.rgba = new Uint8Array(parent);
       for (const r of node.records) {
-        const xor = await decodePatch(r.bytes, r.w, r.h, decodeBytes, allowSparse);
-        // Always XOR against the parent, so overlapping boxes cannot cancel bits.
-        for (let y = 0; y < r.h; y++) for (let x = 0; x < r.w; x++) for (let c = 0; c < 4; c++) { const dest = ((r.y + y) * w + r.x + x) * 4 + c; node.rgba[dest] = parent[dest] ^ xor[(y * r.w + x) * 4 + c]; }
+        const subtracted = r.bytes.length >= 4 && String.fromCharCode(...r.bytes.subarray(0, 4)) === 'SUB1';
+        if (subtracted && !allowSubtract) throw new Error('此版本不允许循环减法分块');
+        const xor = await decodePatch(subtracted ? r.bytes.subarray(4) : r.bytes, r.w, r.h, decodeBytes, allowSparse);
+        // Both operations read the unchanged parent, including overlapping boxes.
+        for (let y = 0; y < r.h; y++) for (let x = 0; x < r.w; x++) for (let c = 0; c < 4; c++) { const dest = ((r.y + y) * w + r.x + x) * 4 + c; const value = xor[(y * r.w + x) * 4 + c]; node.rgba[dest] = subtracted ? (parent[dest] + value) & 255 : parent[dest] ^ value; }
       }
       if (low.crc(node.rgba) !== node.crc) throw new Error(`差分图「${node.name}」恢复校验失败`);
     }
     return nodes.map(({ id, parentId, name, rgba }) => ({ id, parentId, name, rgba, w, h }));
   }
-  return { graph, reroot, mergeChunks, chunkBoxes, chunkPlan, boxesFor, removeContained, bestSplit, refineBoxes, autoBoxes, autoPlan, analyze, coverage, rasterChunkPreview, preview, boxesValid, summarizeMethods, encodePatch, decodePatch, encode, decode };
+  return { graph, reroot, mergeChunks, chunkBoxes, chunkPlan, boxesFor, removeContained, bestSplit, refineBoxes, autoBoxes, autoPlan, analyze, coverage, rasterChunkPreview, preview, boxesValid, summarizeMethods, encodePatch, decodePatch, chooseDelta, encode, decode };
 }
 if (typeof module !== 'undefined') module.exports = DiffCodec;
