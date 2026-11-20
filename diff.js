@@ -329,7 +329,7 @@ function DiffCodec() {
       const sub = await cachedPatch(subtract, w, h, encodeBytes);
       if (sub.bytes.length + 4 < best.bytes.length) {
         const bytes = new Uint8Array(4 + sub.bytes.length); bytes.set([83, 85, 66, 49]); bytes.set(sub.bytes, 4);
-        best = { ...sub, bytes, denseBytes: sub.denseBytes + 4, method: `模256减法 / ${sub.method}`, subtracted: true };
+        best = { ...sub, bytes, denseBytes: sub.denseBytes + 4, method: `SUB / ${sub.method}`, subtracted: true };
       }
     }
     return best;
@@ -359,7 +359,7 @@ function DiffCodec() {
   async function encode(nodes, base, w, h, encodeBytes, report = () => {}) {
     graph(nodes);
     if (nodes.length * w * h > MAX_PIXELS) throw new Error('差分图合计最多 4000 万像素');
-    const byId = new Map(nodes.map(node => [node.id, node])), parts = [], methods = []; let sparse = false, subtracted = false; const chunked = nodes.some(node => node.policy === 'chunk'), extended = nodes.some(node => node.policy === 'auto' && (node.maxBoxes ?? 20) > 64 || node.policy === 'chunk' && (node.chunkRows ?? 32) * (node.chunkCols ?? 32) > 1024);
+    const byId = new Map(nodes.map(node => [node.id, node])), parts = [], methods = [], imageGroups = []; let sparse = false, subtracted = false; const chunked = nodes.some(node => node.policy === 'chunk'), extended = nodes.some(node => node.policy === 'auto' && (node.maxBoxes ?? 20) > 64 || node.policy === 'chunk' && (node.chunkRows ?? 32) * (node.chunkCols ?? 32) > 1024);
     for (const [index, node] of nodes.entries()) {
       const parent = node.parentId === 'base' ? base : byId.get(node.parentId).rgba;
       if (!['auto', 'manual', 'full', 'chunk'].includes(node.policy)) throw new Error('差分图编码方式无效');
@@ -372,6 +372,7 @@ function DiffCodec() {
       if (extended) { hv.setUint16(2, node.policy === 'chunk' ? 1 : node.policy === 'auto' ? 2 : 0); hv.setUint32(4, boxes.length); hv.setUint32(8, parentIndex); hv.setUint32(12, low.crc(node.rgba)); }
       else { hv.setUint16(2, boxes.length); hv.setUint32(4, parentIndex); hv.setUint32(8, low.crc(node.rgba)); }
       header.set(name, headerSize); parts.push(header);
+      const group = { key: `diff-${index + 1}`, label: `差分图 ${index + 1} · ${node.name}`, frames: boxes.length, bytes: header.length }; imageGroups.push(group);
       for (const [patchIndex, r] of boxes.entries()) {
         report({ progress: 100 * (index + patchIndex / Math.max(1, boxes.length)) / Math.max(1, nodes.length), message: `差分图 ${index + 1} / 差值区域 ${patchIndex + 1}` });
         const geometry = `${w}:${r.x},${r.y},${r.w},${r.h}`, key = `delta:${identity(parent)}>${identity(node.rgba)}:${geometry}`, xorKey = `xor:${pairKey(parent, node.rgba)}:${geometry}`;
@@ -385,19 +386,19 @@ function DiffCodec() {
         subtracted ||= block.subtracted;
         sparse ||= block.sparse;
         const record = new Uint8Array(20), rv = view(record);
-        [r.x, r.y, r.w, r.h, block.bytes.length].forEach((value, i) => rv.setUint32(i * 4, value)); parts.push(record, block.bytes);
-        methods.push({ label: `差分图 ${index + 1} · 差值 ${patchIndex + 1}`, method: block.method, bytes: block.bytes.length, denseBytes: block.denseBytes, sparse: block.sparse, chunked: node.policy === 'chunk' });
+        [r.x, r.y, r.w, r.h, block.bytes.length].forEach((value, i) => rv.setUint32(i * 4, value)); parts.push(record, block.bytes); group.bytes += record.length + block.bytes.length;
+        methods.push({ label: `选框 ${patchIndex + 1}`, imageKey: group.key, frame: patchIndex + 1, recordBytes: 20, method: block.method, bytes: block.bytes.length, denseBytes: block.denseBytes, sparse: block.sparse, chunked: node.policy === 'chunk' });
       }
     }
     const bytes = new Uint8Array(20 + parts.reduce((sum, part) => sum + part.length, 0)), v = view(bytes);
     bytes.set([68, 73, 70, extended ? 52 : chunked ? 51 : sparse ? 50 : 49]); v.setUint32(4, nodes.length); v.setUint32(8, w); v.setUint32(12, h); v.setUint32(16, low.crc(base));
-    let offset = 20; for (const part of parts) { bytes.set(part, offset); offset += part.length; } return { bytes, methods, sparse, chunked, extended, subtracted };
+    let offset = 20; for (const part of parts) { bytes.set(part, offset); offset += part.length; } return { bytes, methods, imageGroups, sparse, chunked, extended, subtracted };
   }
   function summarizeMethods(methods, limit = 256) {
     if (methods.length <= limit) return methods;
     const groups = new Map();
     for (const item of methods) {
-      const label = item.label.replace(/ · (?:XOR|差值) \d+$/, ' · 差值'), key = `${label}:${item.method}:${Boolean(item.sparse)}`;
+      const label = item.frame ? '选框' : item.label.replace(/ · (?:XOR|差值) \d+$/, ' · 差值'), key = `${item.imageKey || ''}:${label}:${item.method}:${Boolean(item.sparse)}`;
       let group = groups.get(key);
       if (!group) { group = { ...item, label, bytes: 0, blocks: 0, denseBytes: item.denseBytes === undefined ? undefined : 0 }; groups.set(key, group); }
       group.bytes += item.bytes; group.blocks++; if (group.denseBytes !== undefined) group.denseBytes += item.denseBytes;

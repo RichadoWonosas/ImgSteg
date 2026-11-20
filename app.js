@@ -154,7 +154,7 @@ function workerMain() {
           if (!steg.equal(restored.original, rgba) || !steg.equal(restored.base, result.base) || restored.text !== message.text || !steg.sameAttachments(restored.attachments, extraImages)) throw new Error('导出 PNG 的恢复校验失败');
           if (variants.length !== restored.differences.length || variants.some((node, index) => !steg.equal(node.rgba, restored.differences[index].rgba))) throw new Error('导出 PNG 的差分图校验失败');
         }
-        self.postMessage({ id, action, done: true, w, h, fits: result.fits, bytes: result.bytes, baseBlob, carrierBlob, methods: diff.summarizeMethods(result.methods), textBytes: result.textBytes }, [result.bytes.buffer]);
+        self.postMessage({ id, action, done: true, w, h, fits: result.fits, bytes: result.bytes, baseBlob, carrierBlob, methods: result.methods, imageGroups: result.imageGroups, textBytes: result.textBytes }, [result.bytes.buffer]);
       } else if (action === 'restore') {
         const result = await steg.restore(rgba, w, h, progress);
         if (!result.detected) { self.postMessage({ id, action, done: true, detected: false }); return; }
@@ -197,13 +197,47 @@ function setBusy(value, action = busyAction) {
   for (const button of $('attachment-list').querySelectorAll('button')) button.disabled = value || button.dataset.unavailable === 'true';
   for (const row of $('attachment-list').children) row.draggable = !value;
 }
+function renderCompressionDetails(data) {
+  const groups = $('image-compression-groups'); groups.replaceChildren(); $('compression-details').replaceChildren();
+  const byImage = new Map();
+  for (const item of data.methods) if (item.imageKey) { if (!byImage.has(item.imageKey)) byImage.set(item.imageKey, []); byImage.get(item.imageKey).push(item); }
+  const total = item => item.bytes + (item.recordBytes || 0);
+  const methodRow = item => {
+    const row = document.createElement('li'); row.textContent = `${item.label}：${item.method} · ${format(total(item))} byte${item.recordBytes ? (item.frame ? '（含选框记录）' : '（含文件记录）') : ''}${item.sparse ? `（比整框节省 ${format(item.denseBytes - item.bytes)} byte）` : ''}`; return row;
+  };
+  for (const group of data.imageGroups) {
+    const details = document.createElement('details'), summary = document.createElement('summary'), body = document.createElement('div'); details.className = 'image-compression'; details.dataset.imageKey = group.key;
+    summary.textContent = `${group.label} · ${format(group.frames)} 个${group.key === 'base' ? '遮盖选区' : '选框'} · ${format(group.bytes)} byte`; details.append(summary, body); groups.append(details);
+    let rendered = false;
+    details.ontoggle = () => {
+      if (!details.open || rendered) return; rendered = true;
+      const items = byImage.get(group.key) || [], pageSize = 200, list = document.createElement('ul'); list.className = 'compression-details'; body.append(list);
+      let page = 0;
+      const controls = document.createElement('div'), previous = document.createElement('button'), next = document.createElement('button'), range = document.createElement('span'); controls.className = 'compression-pages'; previous.className = next.className = 'cancel'; previous.textContent = '上一页'; next.textContent = '下一页';
+      previous.setAttribute('aria-label', `${group.label} 上一页`); next.setAttribute('aria-label', `${group.label} 下一页`);
+      const showPage = () => {
+        list.replaceChildren(); const start = page * pageSize, end = Math.min(items.length, start + pageSize);
+        for (let i = start; i < end; i++) list.append(methodRow(items[i]));
+        range.textContent = `${format(start + 1)}–${format(end)} / ${format(items.length)} 条明细`; previous.disabled = page === 0; next.disabled = end === items.length;
+      };
+      previous.onclick = () => { page--; showPage(); }; next.onclick = () => { page++; showPage(); }; showPage();
+      if (items.length > pageSize) { controls.append(previous, range, next); body.append(controls); }
+      const records = group.bytes - items.reduce((sum, item) => sum + total(item), 0);
+      if (records) { const note = document.createElement('p'); note.className = 'hint'; note.textContent = `图片名称与记录：${format(records)} byte`; body.append(note); }
+    };
+  }
+  const other = data.methods.filter(item => !item.imageKey);
+  for (const item of other) $('compression-details').append(methodRow(item));
+  const overhead = data.bytes.length - data.imageGroups.reduce((sum, group) => sum + group.bytes, 0) - other.reduce((sum, item) => sum + total(item), 0);
+  const row = document.createElement('li'); row.textContent = `全局容器与差分区段头：${format(overhead)} byte`; $('compression-details').append(row);
+}
 function resetMetrics() {
   displayedKey = ''; displayedAction = ''; $('payload-summary').textContent = '等待计算';
   $('remaining').innerHTML = '— <small>byte</small>'; $('remaining').classList.remove('error');
   for (const id of ['bytes', 'pixels', 'method']) $(id).textContent = '—';
   for (const id of ['original', 'compressed', 'remaining-bits']) $(id).textContent = '— bit';
   for (const name of ['square', 'standard', 'wide']) { $(`raw-${name}-size`).textContent = '— × —'; $(`raw-${name}-pixels`).textContent = '— 像素'; }
-  $('compression-details').replaceChildren(); $('chunk-compression-list').replaceChildren(); $('chunk-compression').hidden = true; $('chunk-compression').open = false; $('download').disabled = true; $('download').onclick = null;
+  $('compression-details').replaceChildren(); $('image-compression-groups').replaceChildren(); $('download').disabled = true; $('download').onclick = null;
 }
 function clearOutputs() {
   for (const url of outputURLs) URL.revokeObjectURL(url); outputURLs.clear();
@@ -351,12 +385,7 @@ function receive(data) {
     if (mode === 'encode' && creationKind === 'cover' && !baseOriginalPreview && (rawPreview || $('show-fill').checked)) { if (previewURL) URL.revokeObjectURL(previewURL); previewURL = URL.createObjectURL(data.baseBlob); $('preview').src = previewURL; }
     const remaining = BigInt(data.w) * BigInt(data.h) * 9n - BigInt(data.bytes.length) * 8n;
     showMetrics(data.w, data.h, data.bytes.length, '各分块独立择优，详情见下方', data.fits ? '全部恢复数据与文字均可装入，已生成并验证隐写 PNG。' : `容量不足，超出 ${format(-remaining)} bit；请缩小选区、减少文字或更换图片。`);
-    for (const item of data.methods) { const row = document.createElement('li'); row.textContent = `${item.label}：${item.method} · ${format(item.bytes)} byte${item.sparse ? `（比整框节省 ${format(item.denseBytes - item.bytes)} byte）` : ''}`; $(item.chunked ? 'chunk-compression-list' : 'compression-details').append(row); }
-    const chunkMethods = data.methods.filter(item => item.chunked);
-    $('chunk-compression').hidden = !chunkMethods.length; $('chunk-compression').open = false;
-    $('chunk-compression-summary').textContent = `分块压缩明细 · ${format(chunkMethods.reduce((sum, item) => sum + (item.blocks || 1), 0))} 块 · ${format(chunkMethods.reduce((sum, item) => sum + item.bytes, 0))} byte`;
-    const overhead = data.bytes.length - data.methods.reduce((sum, item) => sum + item.bytes, 0);
-    const row = document.createElement('li'); row.textContent = `容器头、选区与附加图片记录：${format(overhead)} byte`; $('compression-details').append(row);
+    renderCompressionDetails(data);
     $('generated').hidden = false; attachDownload('download-base', data.baseBlob, 'ImgSteg-i2.png');
     $('steg-result').hidden = !data.fits; $('overflow-result').hidden = data.fits;
     if (data.fits) {
@@ -509,7 +538,7 @@ function renderDifferences() {
     parentLabel.append(parent);
     const policyLabel = document.createElement('label'); policyLabel.textContent = '编码 ';
     const policy = document.createElement('select'); policy.setAttribute('aria-label', `差分图 ${index + 1} 编码方式`);
-    for (const [value, text] of [['auto', `自动框选（≤${node.maxBoxes ?? 20}）`], ['chunk', `${node.chunkRows ?? 32}×${node.chunkCols ?? 32} 分块自动`], ['manual', '手动框选'], ['full', '全图差值（XOR / 循环减法择优）']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; policy.append(option); }
+    for (const [value, text] of [['auto', `自动框选（≤${node.maxBoxes ?? 20}）`], ['chunk', `${node.chunkRows ?? 32}×${node.chunkCols ?? 32} 分块自动`], ['manual', '手动框选'], ['full', '全图差值（XOR / SUB 择优）']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; policy.append(option); }
     policy.value = node.policy; policy.disabled = busy;
     policy.onchange = () => {
       if (node.policy === 'auto' && policy.value === 'manual') {

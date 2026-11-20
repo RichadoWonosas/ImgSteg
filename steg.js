@@ -211,13 +211,13 @@ function ImgSteg() {
     const parts = [], methods = [];
     const stage = (index, label) => update => report({ progress: 5 + 80 * (index + update.progress / 100) / (regions.length + attachments.length + (differences.length ? 1 : 0) + 3), message: `${label}：${update.message}` });
     let lsb = await remembered(`low:${baseKey}`, () => low.encode(low.extract(base), w, h, stage(0, '压缩 i2 的低 3 位')));
-    parts.push(lsb.bytes); methods.push({ label: 'i2 LSB3', method: lsb.method, bytes: lsb.bytes.length });
+    parts.push(lsb.bytes); methods.push({ label: 'i2 LSB3', imageKey: 'base', method: lsb.method, bytes: lsb.bytes.length });
     let alpha = new Uint8Array(w * h); let opaque = true;
     for (let p = 0; p < alpha.length; p++) { alpha[p] = base[p * 4 + 3]; if (alpha[p] !== 255) opaque = false; }
     let alphaLength = 0, alphaBlock;
     if (!opaque) {
       const block = await remembered(`alpha:${baseKey}`, () => encodeAlpha(alpha, w, h, stage(1, '压缩透明通道'))); alphaBlock = block;
-      parts.push(block.bytes); alphaLength = block.bytes.length; methods.push({ label: 'i2 Alpha', method: block.method, bytes: alphaLength });
+      parts.push(block.bytes); alphaLength = block.bytes.length; methods.push({ label: 'i2 Alpha', imageKey: 'base', method: block.method, bytes: alphaLength });
     }
     alpha = null;
     for (let index = 0; index < regions.length; index++) {
@@ -225,12 +225,13 @@ function ImgSteg() {
       const block = await remembered(`region:${r.x},${r.y},${r.w},${r.h}`, () => encodeBytes(data, r.w, r.h, 4, stage(index + 2, `压缩选区 ${index + 1} 的完整 RGBA`)));
       const record = new Uint8Array(24), v = viewOf(record);
       v.setUint32(0, r.x); v.setUint32(4, r.y); v.setUint32(8, r.w); v.setUint32(12, r.h); record[16] = modes.indexOf(r.mode); v.setUint32(20, block.bytes.length);
-      parts.push(record, block.bytes); methods.push({ label: `选区 ${index + 1}`, method: block.method, bytes: block.bytes.length });
+      parts.push(record, block.bytes); methods.push({ label: `遮盖选区 ${index + 1}`, imageKey: 'base', frame: index + 1, recordBytes: 24, method: block.method, bytes: block.bytes.length });
     }
+    let differenceGroups = [];
     let diffLength = 0, sparseDifferences = false, chunkedDifferences = false, extendedDifferences = false, subtractedDifferences = false;
     if (differences.length) {
       const block = await diffCodec.encode(differences, original, w, h, encodeBytes, stage(regions.length + 2, '压缩差分图'));
-      parts.push(block.bytes); diffLength = block.bytes.length; sparseDifferences = block.sparse; chunkedDifferences = block.chunked; extendedDifferences = block.extended; subtractedDifferences = block.subtracted; methods.push(...block.methods);
+      parts.push(block.bytes); diffLength = block.bytes.length; sparseDifferences = block.sparse; chunkedDifferences = block.chunked; extendedDifferences = block.extended; subtractedDifferences = block.subtracted; methods.push(...block.methods); differenceGroups = block.imageGroups;
     }
     let attachmentLength = 0;
     for (let index = 0; index < attachments.length; index++) {
@@ -240,7 +241,7 @@ function ImgSteg() {
       const record = new Uint8Array(16 + name.length + type.length), rv = viewOf(record);
       rv.setUint16(0, name.length); rv.setUint16(2, type.length); rv.setUint32(4, block.bytes.length); rv.setUint32(8, item.w); rv.setUint32(12, item.h);
       record.set(name, 16); record.set(type, 16 + name.length); parts.push(record, block.bytes); attachmentLength += record.length + block.bytes.length;
-      methods.push({ label: `附加图片 ${index + 1} · ${item.name}`, method: block.method, bytes: block.bytes.length });
+      methods.push({ label: `附加图片 ${index + 1} · ${item.name}`, recordBytes: record.length, method: block.method, bytes: block.bytes.length });
     }
     let textLength = 0;
     if (textData.length) {
@@ -252,8 +253,8 @@ function ImgSteg() {
     const savings = (sparseLow ? lsb.legacy.bytes.length - lsb.bytes.length : 0) + (sparseAlpha ? alphaBlock.legacy.bytes.length - alphaBlock.bytes.length : 0);
     let modern = sparseLow || sparseAlpha || subtractedDifferences;
     if (modern && !subtractedDifferences && savings <= 64 - header) {
-      if (sparseLow) { lsb = lsb.legacy; parts[0] = lsb.bytes; methods[0] = { label: 'i2 LSB3', method: lsb.method, bytes: lsb.bytes.length }; }
-      if (sparseAlpha) { alphaBlock = alphaBlock.legacy; parts[1] = alphaBlock.bytes; alphaLength = alphaBlock.bytes.length; methods[1] = { label: 'i2 Alpha', method: alphaBlock.method, bytes: alphaLength }; }
+      if (sparseLow) { lsb = lsb.legacy; parts[0] = lsb.bytes; methods[0] = { label: 'i2 LSB3', imageKey: 'base', method: lsb.method, bytes: lsb.bytes.length }; }
+      if (sparseAlpha) { alphaBlock = alphaBlock.legacy; parts[1] = alphaBlock.bytes; alphaLength = alphaBlock.bytes.length; methods[1] = { label: 'i2 Alpha', imageKey: 'base', method: alphaBlock.method, bytes: alphaLength }; }
       modern = false;
     }
     if (modern) header = 64;
@@ -275,7 +276,8 @@ function ImgSteg() {
       if (!equal(restored.original, original) || !equal(restored.base, base) || restored.text !== text || !sameAttachments(restored.attachments, attachments)) throw new Error('隐写端到端往返验证失败');
       if (differences.length !== restored.differences.length || differences.some((node, index) => !equal(node.rgba, restored.differences[index].rgba))) throw new Error('差分图往返验证失败');
     }
-    return { fits, bytes, carrier, base, methods, w, h, textBytes: textData.length, attachmentCount: attachments.length, cacheHits };
+    const imageGroups = [{ key: 'base', label: '基底原图恢复（含 i2）', frames: regions.length, bytes: methods.filter(item => item.imageKey === 'base').reduce((sum, item) => sum + item.bytes + (item.recordBytes || 0), 0) }, ...differenceGroups];
+    return { fits, bytes, carrier, base, methods, imageGroups, w, h, textBytes: textData.length, attachmentCount: attachments.length, cacheHits };
   }
   async function restore(carrier, w, h, report = () => {}) {
     const info = probe(carrier, w, h);
