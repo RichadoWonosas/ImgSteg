@@ -15,8 +15,8 @@ The resulting PNG can restore the original image, the base image **i2**, a whole
 - Multiple attached images, preserving their original file bytes, names, formats, metadata, and animations. Reorder them by dragging or using the move buttons.
 - UTF-8 messages, including newlines, Chinese, emoji, a leading BOM, and NUL characters.
 - Independent compression selection for each block, with precise capacity accounting and a raw-storage fallback.
-- Difference-image families with arbitrary acyclic parent relationships, including parents uploaded later. Each image supports automatic boxes (at most 10), manual boxes with exact coverage validation, or full-image XOR.
-- Automatic ImgSteg v1/v2/v3/v4/v5 detection and recovery of the original image, i2, derived images, ordered attachments, and text.
+- Difference-image families with arbitrary acyclic parent relationships, including parents uploaded later. Each image supports automatic boxes (at most 20), 32×32 automatic chunks, manual boxes with exact coverage validation, or full-image XOR.
+- Automatic ImgSteg v1/v2/v3/v4/v5/v6 detection and recovery of the original image, i2, derived images, ordered attachments, and text.
 - Export verification: the generated PNG is read back and its recovered contents are compared byte for byte before a successful result is shown.
 - Remaining capacity in bits, bytes, equivalent RGB pixels, and maximum exact-aspect RAW dimensions for 1:1, 4:3, and 16:9.
 - A compact floating capacity/progress dock that shows remaining whole bytes by default, with the exact remaining bit count in expandable details; sticky mode navigation and light/dark/system themes with an adjustable hue (default: 270°).
@@ -45,13 +45,14 @@ File drops are accepted only in the image preview panel. With a base already loa
 
 Each image can use:
 
-- **自动框选**: generate up to 10 rectangles covering every different pixel, then remove completely contained rectangles and duplicates. Switching from automatic to manual preserves those boxes, even for an image that has not been opened in the editor.
+- **自动框选**: generate up to 20 rectangles covering every different pixel, then remove completely contained rectangles and duplicates. Switching from automatic to manual preserves those boxes, even for an image that has not been opened in the editor.
+- **32×32 分块自动**: shrink changed chunks and merge adjacent unshrunk chunks, with a read-only grid/result preview (up to 1024 rectangles).
 - **手动框选**: draw/edit rectangles with the existing editor. The image is dimmed by 50%, and changed RGBA pixels are marked white (`#FFFFFF`). After the first rectangle, still-uncovered changed pixels appear pale red (`#FFDDDD`). Packing is refused until coverage is complete.
 - **全图 XOR**: XOR all RGBA samples against the parent and compress the result as one full-frame block. No manual selection is needed. Sparse differences can compress well even in this simplest mode.
 
 Differences are exact 8-bit RGBA comparisons, including Alpha and hidden RGB values supported by direct PNG decoding. A difference image restores decoded pixels as a new PNG, rather than the source file's original encoding or metadata. Use ordinary attachments when exact original file bytes are needed.
 
-Automatic selection follows connected-component bounding-box analysis, as described in the [OpenCV shape documentation](https://docs.opencv.org/4.5.4/d3/dc0/group__imgproc__shape.html), implemented here without OpenCV or other dependencies. An adaptive grid of at most 256×256 cells retains exact extrema of changed pixels, eight-connected components yield initial boxes, and excessive components are grouped spatially using Morton order. Greedy merging minimizes the additional bounding area of each pair until at most 10 remain. This bounded heuristic guarantees coverage, not globally minimal area or optimal compression.
+Automatic selection follows connected-component bounding-box analysis, as described in the [OpenCV shape documentation](https://docs.opencv.org/4.5.4/d3/dc0/group__imgproc__shape.html), implemented here without OpenCV or other dependencies. An adaptive grid of at most 256×256 cells retains exact extrema of changed pixels, eight-connected components yield initial boxes, and excessive components are grouped spatially using Morton order. Greedy merging minimizes the additional bounding area of each pair until at most 10 initial boxes remain. A refinement pass then tries the largest improvable box first, scans both axes, and splits into two tight difference bounds with the greatest positive area reduction. Empty row/column gaps take priority. If the largest box cannot improve, smaller boxes are tried. Refinement stops at 20 boxes or when no positive reduction remains. This bounded heuristic guarantees coverage, not globally minimal area or optimal compression.
 
 Selected rectangles store parent/child XOR bytes, independently compressed with B8C1. Reconstruction always XORs against the unchanged parent, so overlapping rectangles do not cancel data. Images are reconstructed in topological order and checked against each image's RGBA CRC-32. Storage order still follows upload order, and parents may refer forward.
 
@@ -118,7 +119,7 @@ The exported carrier is opaque. Original/i2 Alpha values are recovered from the 
 | Attached image files | 32 |
 | Combined original attachment file size | 32 MiB |
 | Difference images | 16, each the same size as i2; 40 million pixels combined |
-| Difference selection | At most 10 automatic boxes, or 64 manual boxes per image |
+| Difference selection | At most 20 automatic boxes, 1024 read-only chunk results, or 64 manual boxes per image |
 | UTF-8 message | 4 MiB; the interface allows up to 1 million UTF-16 code units |
 
 Available payload capacity can be much lower than these input limits. Large inputs can still exhaust device memory. Candidate compression runs sequentially in a Worker. Changing the carrier or cancelling terminates the Worker and clears the attachment list; choose the image again to restart.
@@ -130,7 +131,7 @@ Available payload capacity can be much lower than these input limits. Large inpu
 All integers use big-endian byte order. The payload is self-describing; decoding needs the format implementation and a supported decompressor, but no original image or external sidecar file.
 
 ```text
-IMGSTEG1 header (48 bytes), IMGSTEG2 (56 bytes), or IMGSTEG3 (64 bytes)
+IMGSTEG1 header (48 bytes), IMGSTEG2 (56 bytes), or IMGSTEG3–6 (64 bytes)
 i2 RGB low-bit block (L3B1)
 optional i2 Alpha block (B8C1)
 region record + original RGBA block (B8C1), repeated in selection order
@@ -159,7 +160,7 @@ optional UTF-8 message block (B8C1), always last
 | 56 | 4 | v3/v4: difference-image count |
 | 60 | 4 | v3/v4: complete DIF1 section length |
 
-With no difference images, no attachments means v1 and attachments enable v2. Dense-only difference images without covers enable v3; combining covers and dense differences enables v4; sparse differences enable v5. v3/v4 retain the attachment fields at offsets 48/52 even when there are no attachments. The body CRC starts after the actual 48/56/64-byte header. The current reader supports all five versions; older readers cannot decode newer versions.
+With no difference images, no attachments means v1 and attachments enable v2. Dense-only difference images without covers enable v3; combining covers and dense differences enables v4; sparse differences enable v5. v3/v4 retain the attachment fields at offsets 48/52 even when there are no attachments. The body CRC starts after the actual 48/56/64-byte header. The current reader supports all six versions; older readers cannot decode newer versions.
 
 ### DIF1 section
 
@@ -215,6 +216,18 @@ The existing native candidates are joined by **fflate 0.8.2 DEFLATE level 9** an
 
 Algorithm IDs 6 and 7 extend L3B1/B8C1 for the local DEFLATE-9 and Brotli-11 encoders/readers; 0–5 retain their meanings. Their compressed streams are standard raw DEFLATE and Brotli. Native Brotli/raw-DEFLATE decoding can fall back to the bundled codecs when unavailable. Old readers may not support these new algorithm IDs even when the outer container is v1–v4.
 
-A sparse-enabled difference section uses **DIF2** (the DIF1 records remain unchanged), and its outer container is **IMGSTEG5** with the same 64-byte header/root semantics as v4. Dense-only difference sections keep DIF1 and v3/v4. In DIF2, each patch payload is either the original B8C1 dense block or **SPX1**: 4-byte magic; uint32 width, height, changed-pixel count and dense-XOR CRC-32; then one B8C1 block. All integers are big-endian. The B8C1 decoded bytes contain `ceil(w*h/8)` MSB-first mask bytes, `4*count` RGBA XOR bytes, and zero padding to a multiple of four (encoded as width=paddedLength/4, height=1, channels=4). Count, dimensions, mask padding, zero padding, nonzero changed values and CRC are checked. The current reader accepts v1–v5 and DIF1/DIF2; sparse files require the updated reader.
+Outside chunk mode, a sparse-enabled difference section uses **DIF2** (the DIF1 records remain unchanged), and its outer container is **IMGSTEG5** with the same 64-byte header/root semantics as v4. Dense-only difference sections keep DIF1 and v3/v4. In DIF2, each patch payload is either the original B8C1 dense block or **SPX1**: 4-byte magic; uint32 width, height, changed-pixel count and dense-XOR CRC-32; then one B8C1 block. All integers are big-endian. The B8C1 decoded bytes contain `ceil(w*h/8)` MSB-first mask bytes, `4*count` RGBA XOR bytes, and zero padding to a multiple of four (encoded as width=paddedLength/4, height=1, channels=4). Count, dimensions, mask padding, zero padding, nonzero changed values and CRC are checked. The current reader accepts v1–v6 and DIF1/DIF2/DIF3; sparse files require the updated reader.
 
 Focused measurements (synthetic data, not a general compression guarantee): in the development browser, a 128×128 structured LSB sample decreased from 235 bytes using native DEFLATE to 77 bytes using Brotli WASM, with the full search taking about 87 ms vs 514 ms. A 256×256 sparse random-change XOR block decreased from 4,674 to 4,113 bytes including block headers (about 12%); dense random and zero data retained their dense representation. Full PNG v5 restore and legacy v1–v4 compatibility were checked. High-quality compression trades encoding time and the bundled download size for potential capacity gains.
+
+## 32×32 automatic chunks
+
+Choose **32×32 分块自动** in a difference image's encoding selector, then **分块预览** to inspect the result. Each axis is divided into 32 integer intervals (`floor(i*dimension/32)` boundaries); dimensions below 32 use that many nonempty intervals. Empty chunks are discarded. Every changed chunk is tightened to its exact difference bounding box. Only chunks whose bounds did not shrink may merge; empty or shrunken chunks are never bridged.
+
+The eligible chunk mask is partitioned using horizontal/vertical run sweeps and largest-rectangle-first histogram searches with two tie-breaking orientations. Adjacent rectangles with matching full edges are joined; the candidate with the fewest rectangles wins (perimeter breaks ties). This guarantees exact eligible-cell coverage, not a globally minimum rectangle partition or minimum compressed size.
+
+The preview shows the original grid in gray, shrunken boxes in orange, merged boxes in green and untouched-size singleton chunks in the theme color. The summary reports changed/shrunken chunks and rectangle savings. It is read-only, with no drawing, handles, coordinate-input list or manual selection buttons. Original-color previews remain available. Packing uses exactly the same rectangles as preview and still compares dense/sparse XOR and codec candidates per rectangle. Many small chunks add header and compression work, so this mode is not guaranteed to be smaller than ordinary automatic selection.
+
+Chunk mode emits **IMGSTEG6 / DIF3**, retaining the 64-byte header and original-root semantics of v4/v5. DIF3 preserves existing records and dense/SPX1 patch blocks, but allows up to **1024 patches per image**; DIF1/DIF2 retain their 64-patch decode limit. The manual encoder still permits at most 64 boxes, and ordinary automatic selection at most 20. The reader accepts older v1–v5 files; chunk files need the updated reader.
+
+Focused verification covers exhaustive small-mask split comparisons, skipping an unsplittable largest box, gap splitting, 20-box limits, exact chunk shrink/merge coverage, tiny/non-divisible dimensions, 1024 shrunken patch records, sparse DIF3, and covered PNG v6 round trips. Browser acceptance confirms read-only rendering, four mixed result rectangles from 99 changed chunks, complete v6 restore with attachments/text, and preservation of all 20 coordinates when ordinary automatic selection switches to manual. No full regression run was performed.

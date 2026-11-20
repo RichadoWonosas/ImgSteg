@@ -97,9 +97,9 @@ function workerMain() {
         const nodes = differenceNodes(message.differences), node = nodes.find(item => item.id === message.nodeId);
         if (!node) throw new Error('请选择差分图');
         const parent = node.parentId === 'base' ? rgba : nodes.find(item => item.id === node.parentId).rgba;
-        const analysis = diff.analyze(parent, node.rgba, w, h), boxes = node.policy === 'full' ? [{ x: 0, y: 0, w, h }] : node.policy === 'auto' ? analysis.boxes : node.regions;
-        const result = diff.preview(node.rgba, analysis, w, h, boxes);
-        self.postMessage({ id, action, done: true, revision: message.revision, nodeId: node.id, boxes, count: analysis.count, missing: result.missing, blob: await png.encode(result.rgba, w, h) });
+        const analysis = diff.analyze(parent, node.rgba, w, h), boxes = diff.boxesFor(node, analysis, w, h);
+        const result = diff.preview(node.rgba, analysis, w, h, boxes), plan = node.policy === 'chunk' ? diff.chunkPlan(analysis, w, h) : null;
+        self.postMessage({ id, action, done: true, revision: message.revision, nodeId: node.id, boxes, chunk: plan ? { grid: plan.grid, stats: plan.stats } : null, count: analysis.count, missing: result.missing, blob: await png.encode(result.rgba, w, h) });
       } else if (action === 'attachments') {
         const items = [];
         if (attachedFiles.size + message.files.length > 32) throw new Error('最多附加 32 张图片');
@@ -279,10 +279,11 @@ function receive(data) {
     if (data.revision !== revision || data.nodeId !== activeDifferenceId || creationKind !== 'difference' || rawPreview || mode !== 'encode') return;
     if (data.error) { status(data.error, true); $('diff-status').textContent = data.error; return; }
     const node = activeDifference(); if (!node) return;
-    node.count = data.count; node.missing = data.missing;
+    node.count = data.count; node.missing = data.missing; node.chunk = data.chunk;
     if (node.policy !== 'manual') { node.regions = data.boxes.map(r => ({ ...r, mode: 'mosaic' })); regions = node.regions; selectedIndex = -1; }
     if (previewURL) URL.revokeObjectURL(previewURL); previewURL = URL.createObjectURL(data.blob); $('preview').src = previewURL;
-    $('diff-status').textContent = `差异 ${format(data.count)} 像素 · 未覆盖 ${format(data.missing)} 像素 · ${data.boxes.length} 个框`;
+    const stats = data.chunk?.stats;
+    $('diff-status').textContent = `差异 ${format(data.count)} 像素 · 未覆盖 ${format(data.missing)} 像素 · ${data.boxes.length} 个框${stats ? `；${stats.total} 个分块，变化 ${stats.active}，收缩 ${stats.shrunk}，未收缩 ${stats.unshrunk} → ${stats.retained} 个矩形（合并减少 ${stats.saved} 个）` : ''}`;
     $('diff-status').classList.toggle('error', data.missing > 0); renderRegions(); setBusy(busy); return;
   }
   if (data.action === 'preview') {
@@ -304,7 +305,7 @@ function receive(data) {
     $('preview-box').hidden = false; $('dropzone').hidden = true;
     $('selection-overlay').setAttribute('viewBox', `0 0 ${data.w} ${data.h}`);
     $('dimensions').textContent = `${format(data.w)} × ${format(data.h)} px`; $('source-info').textContent = data.source;
-    $('detection').textContent = data.detectionError || (data.detected ? (mode === 'decode' ? '发现 ImgSteg 标记，正在自动提取并校验。' : '发现 ImgSteg 标记，可切换到“识别与还原”提取内容。') : '未发现本项目的 ImgSteg v1/v2/v3/v4/v5 标记。');
+    $('detection').textContent = data.detectionError || (data.detected ? (mode === 'decode' ? '发现 ImgSteg 标记，正在自动提取并校验。' : '发现 ImgSteg 标记，可切换到“识别与还原”提取内容。') : '未发现本项目的 ImgSteg v1/v2/v3/v4/v5/v6 标记。');
     $('detection').classList.toggle('error', Boolean(data.detectionError));
     $('state').textContent = '就绪'; $('result-note').textContent = mode === 'decode' ? (data.detected ? '已识别隐写标记，正在提取恢复数据。' : '此图片未发现本项目的隐写格式。') : '框选区域、填写文字后，点击“计算并生成隐写 PNG”。';
     status('可在图片上拖出多个矩形选区。', false, 0); setBusy(false); renderRegions();
@@ -318,7 +319,7 @@ function receive(data) {
     sourceURL = chosen.previewURL; $('filename').textContent = chosen.name;
     const previous = next.find(node => node.id === chosen.id); previous.name = oldName; previous.previewURL = oldURL;
     differences = next; image.detected = data.detected; $('source-info').textContent = data.source;
-    $('detection').textContent = data.detected ? '发现 ImgSteg 标记，可切换到识别与还原。' : '未发现本项目的 ImgSteg v1/v2/v3/v4/v5 标记。'; $('detection').classList.remove('error');
+    $('detection').textContent = data.detected ? '发现 ImgSteg 标记，可切换到识别与还原。' : '未发现本项目的 ImgSteg v1/v2/v3/v4/v5/v6 标记。'; $('detection').classList.remove('error');
     resultCache.clear(); displayedKey = displayedAction = ''; editDifference(null); changed(); $('state').textContent = '已切换基底'; status('已重定向父本路径并迁移遮盖；图片、附图与文字均保留，无需重新上传。', false, 100);
   } else if (data.action === 'diff-manual') {
     const node = differences.find(item => item.id === data.nodeId); if (!node) return;
@@ -495,7 +496,7 @@ function renderDifferences() {
     parentLabel.append(parent);
     const policyLabel = document.createElement('label'); policyLabel.textContent = '编码 ';
     const policy = document.createElement('select'); policy.setAttribute('aria-label', `差分图 ${index + 1} 编码方式`);
-    for (const [value, text] of [['auto', '自动框选（≤10）'], ['manual', '手动框选'], ['full', '全图 XOR']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; policy.append(option); }
+    for (const [value, text] of [['auto', '自动框选（≤20）'], ['chunk', '32×32 分块自动'], ['manual', '手动框选'], ['full', '全图 XOR']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; policy.append(option); }
     policy.value = node.policy; policy.disabled = busy;
     policy.onchange = () => {
       if (node.policy === 'auto' && policy.value === 'manual') {
@@ -507,7 +508,7 @@ function renderDifferences() {
     policyLabel.append(policy); fields.append(parentLabel, policyLabel);
     const buttons = document.createElement('div'), view = document.createElement('button'), edit = document.createElement('button'), remove = document.createElement('button'); buttons.className = 'difference-actions';
     view.textContent = '预览'; view.className = 'text-button'; view.disabled = busy; view.setAttribute('aria-label', `预览差分图 ${index + 1}`); view.onclick = () => editDifference(node.id, true);
-    edit.textContent = node.id === activeDifferenceId && !rawPreview ? '正在编辑' : '编辑'; edit.className = 'text-button'; edit.setAttribute('aria-label', `编辑差分图 ${index + 1}`); edit.disabled = busy; edit.onclick = () => editDifference(node.id);
+    edit.textContent = node.policy === 'chunk' ? '分块预览' : node.id === activeDifferenceId && !rawPreview ? '正在编辑' : '编辑'; edit.className = 'text-button'; edit.setAttribute('aria-label', node.policy === 'chunk' ? `查看分块差分图 ${index + 1}` : `编辑差分图 ${index + 1}`); edit.disabled = busy; edit.onclick = () => editDifference(node.id);
     remove.textContent = '移除'; remove.className = 'text-button'; remove.disabled = busy; remove.setAttribute('aria-label', `移除差分图 ${index + 1}`);
     remove.onclick = () => {
       URL.revokeObjectURL(node.previewURL); differences.splice(index, 1);
@@ -613,12 +614,19 @@ function applyGeometry(rect) {
 function renderOverlay(draft) {
   const overlay = $('selection-overlay'); overlay.replaceChildren();
   if (rawPreview) return;
+  const chunkMode = activeDifference()?.policy === 'chunk', grid = activeDifference()?.chunk?.grid;
+  if (chunkMode && grid) {
+    for (const x of grid.xs) { const line = document.createElementNS(svgNS, 'line'); line.setAttribute('x1', x); line.setAttribute('x2', x); line.setAttribute('y1', 0); line.setAttribute('y2', image.h); line.setAttribute('class', 'chunk-grid'); overlay.append(line); }
+    for (const y of grid.ys) { const line = document.createElementNS(svgNS, 'line'); line.setAttribute('x1', 0); line.setAttribute('x2', image.w); line.setAttribute('y1', y); line.setAttribute('y2', y); line.setAttribute('class', 'chunk-grid'); overlay.append(line); }
+  }
   [...regions, ...(draft ? [draft] : [])].forEach((r, index) => {
     const rect = document.createElementNS(svgNS, 'rect');
     for (const [name, value] of Object.entries({ x: r.x, y: r.y, width: r.w, height: r.h })) rect.setAttribute(name, value);
-    rect.setAttribute('class', 'selection-rect'); overlay.append(rect);
+    rect.setAttribute('class', `selection-rect${chunkMode ? ` chunk-box chunk-${r.kind || 'cell'}` : ''}`); overlay.append(rect);
+    if (chunkMode) { const title = document.createElementNS(svgNS, 'title'); title.textContent = `${r.kind === 'shrunk' ? '收缩' : r.kind === 'merged' ? `合并 ${r.cells} 块` : '未收缩'}：${r.x}, ${r.y} · ${r.w} × ${r.h}`; rect.append(title); return; }
     const text = document.createElementNS(svgNS, 'text'); text.setAttribute('x', r.x + 3); text.setAttribute('y', r.y + 3); text.setAttribute('class', 'selection-number'); text.setAttribute('font-size', image ? Math.max(image.w / 55, 8) : 10); text.textContent = index + 1; overlay.append(text);
   });
+  if (chunkMode) { $('selection-help').textContent = '分块模式只读：灰线为原始网格，橙色为收缩框，绿色为合并框，紫色为未收缩单块；不提供手动画框或调整。'; return; }
   if (regions[selectedIndex]) {
     const r = regions[selectedIndex], bounds = overlay.getBoundingClientRect();
     const hx = image.w / Math.max(bounds.width, 1) * 4.5, hy = image.h / Math.max(bounds.height, 1) * 4.5;
@@ -637,7 +645,10 @@ function renderOverlay(draft) {
   else if (creationKind === 'difference' && !regionsEditable()) $('selection-help').textContent = activeDifference() ? '自动框选与全图 XOR 的选框只读；切换到手动框选后可编辑。' : '请先选择一张差分图进行预览或框选。';
 }
 function renderRegions() {
-  $('region-list').replaceChildren(); $('region-count').textContent = `${regions.length} 个选区`; $('no-regions').hidden = regions.length !== 0;
+  const chunkMode = activeDifference()?.policy === 'chunk';
+  $('chunk-legend').hidden = !chunkMode || rawPreview; $('region-buttons').hidden = chunkMode;
+  $('region-list').replaceChildren(); $('region-count').textContent = chunkMode ? `${regions.length} 个自动矩形` : `${regions.length} 个选区`; $('no-regions').hidden = regions.length !== 0;
+  if (chunkMode) { $('no-regions').hidden = true; if (rawPreview) $('selection-help').textContent = '原色预览模式；点击分块预览查看收缩与合并结果。'; renderOverlay(); return; }
   regions.forEach((r, index) => {
     const row = document.createElement('li'), title = document.createElement('div'); title.className = 'region-title'; row.classList.toggle('selected-region', index === selectedIndex);
     row.classList.toggle('clickable-row', !busy && regionsEditable());
